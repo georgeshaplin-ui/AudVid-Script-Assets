@@ -7,6 +7,7 @@ import time
 import traceback
 
 import numpy as np
+import pandas as pd
 import requests
 import runpod
 import torch
@@ -22,6 +23,29 @@ DEFAULT_BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_MB", "500")) * 1024 * 1024
 DOWNLOAD_TIMEOUT_S = int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120"))
 DIARIZATION_CACHE = "/runpod-volume/hf" if os.path.isdir("/runpod-volume") else None
+SAMPLE_RATE = 16000
+
+# community-1 defaults (threshold 0.60, Fb 0.80) merge distinct voices that arrive
+# through the proxy as one 16 kHz mono WAV. These stay inside the published VBx
+# search range, but toward the sensitive end: lower distance / lower Fb = more speakers.
+DIAR_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.50"))
+DIAR_FA = float(os.environ.get("DIARIZATION_FA", "0.07"))
+DIAR_FB = float(os.environ.get("DIARIZATION_FB", "0.45"))
+DIAR_MIN_DURATION_OFF = float(os.environ.get("DIARIZATION_MIN_DURATION_OFF", "0.0"))
+# The stock filter drops a voice unless it speaks alone for 20% of a 10s chunk.
+# Short dialogue then has fewer than two embeddings, and VBx labels everyone
+# SPEAKER_00 — even when min_speakers was requested.
+DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.05"))
+# Euclidean distance on unit embeddings. 0.64 ≈ cosine 0.80.
+DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.64"))
+# Automatic rescue refuses to split voices that are still this similar.
+DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.84"))
+DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "2.5"))
+DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "96"))
+# Just above one 2.5s probe window, so a single odd window cannot invent a speaker
+# while a voice that occupies two windows still can.
+DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "2.7"))
+DIAR_MAX_AUTO_SPEAKERS = int(os.environ.get("DIARIZATION_MAX_AUTO_SPEAKERS", "8"))
 
 print(f"[init] device={DEVICE} compute_type={COMPUTE_TYPE} model={WHISPER_MODEL_PATH}", flush=True)
 _t0 = time.time()
@@ -97,6 +121,537 @@ def _optional_int(job_input, key):
     return int(value) if value not in (None, "") else None
 
 
+def _normalize_rows(matrix):
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        return matrix
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.clip(norms, 1e-8, None)
+
+
+def _compact_labels(labels):
+    labels = np.asarray(labels, dtype=int)
+    mapping = {old: new for new, old in enumerate(sorted(set(int(value) for value in labels)))}
+    return np.array([mapping[int(value)] for value in labels], dtype=int)
+
+
+def _min_centroid_cosine(matrix, labels):
+    labels = np.asarray(labels, dtype=int)
+    ids = sorted(set(int(value) for value in labels))
+    if len(ids) < 2:
+        return 1.0
+    centroids = []
+    for label in ids:
+        block = matrix[labels == label]
+        if block.size == 0:
+            continue
+        centroid = block.mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm < 1e-8:
+            continue
+        centroids.append(centroid / norm)
+    if len(centroids) < 2:
+        return 1.0
+    similarity = np.vstack(centroids) @ np.vstack(centroids).T
+    mask = ~np.eye(similarity.shape[0], dtype=bool)
+    return float(np.min(similarity[mask]))
+
+
+def _merge_to_max(matrix, labels, max_clusters):
+    labels = np.asarray(labels, dtype=int).copy()
+    while len(set(int(value) for value in labels)) > max_clusters:
+        ids = sorted(set(int(value) for value in labels))
+        centroids = []
+        for label in ids:
+            centroid = matrix[labels == label].mean(axis=0)
+            centroids.append(centroid / max(np.linalg.norm(centroid), 1e-8))
+        similarity = np.vstack(centroids) @ np.vstack(centroids).T
+        np.fill_diagonal(similarity, -2.0)
+        left, right = np.unravel_index(int(np.argmax(similarity)), similarity.shape)
+        labels[labels == ids[int(right)]] = ids[int(left)]
+    return _compact_labels(labels)
+
+
+def _kmeans_labels(matrix, n_clusters):
+    from sklearn.cluster import KMeans
+
+    return KMeans(n_clusters=int(n_clusters), n_init=10, random_state=0).fit_predict(matrix).astype(int)
+
+
+def _cluster_embeddings(matrix, distance_threshold, min_clusters=1, max_clusters=8):
+    """Cluster speaker embeddings.
+
+    Rows are L2-normalized. Returns labels starting at 0 and the lowest cosine
+    similarity between cluster centroids (1.0 when a single cluster remains).
+    """
+    matrix = _normalize_rows(matrix)
+    count = int(matrix.shape[0]) if matrix.ndim == 2 else 0
+    if count == 0:
+        return np.zeros(0, dtype=int), 1.0
+    max_clusters = int(max(1, min(int(max_clusters), count)))
+    min_clusters = int(max(1, min(int(min_clusters), max_clusters)))
+    if count == 1 or max_clusters == 1:
+        return np.zeros(count, dtype=int), 1.0
+
+    if min_clusters >= 2 and min_clusters == max_clusters:
+        labels = _kmeans_labels(matrix, min_clusters)
+    else:
+        from scipy.cluster.hierarchy import fcluster, linkage
+
+        linked = linkage(matrix, method="average", metric="euclidean")
+        raw = fcluster(linked, t=float(distance_threshold), criterion="distance")
+        labels = _merge_to_max(matrix, _compact_labels(raw), max_clusters)
+        if len(set(int(value) for value in labels)) < min_clusters:
+            labels = _kmeans_labels(matrix, min_clusters)
+    return _compact_labels(labels), _min_centroid_cosine(matrix, labels)
+
+
+def _fold_short_clusters(spans, labels, matrix, min_seconds, protect=1):
+    labels = np.asarray(labels, dtype=int).copy()
+    durations = {}
+    for label, (start, end) in zip(labels, spans):
+        durations[int(label)] = durations.get(int(label), 0.0) + max(0.0, float(end) - float(start))
+    keep = [label for label, duration in durations.items() if duration >= min_seconds]
+    if len(keep) < max(1, int(protect)) or len(keep) == len(durations):
+        return labels
+    centroids = {}
+    for label in keep:
+        centroid = matrix[labels == label].mean(axis=0)
+        centroids[label] = centroid / max(np.linalg.norm(centroid), 1e-8)
+    for label, duration in durations.items():
+        if duration >= min_seconds or not np.any(labels == label):
+            continue
+        point = matrix[labels == label].mean(axis=0)
+        point = point / max(np.linalg.norm(point), 1e-8)
+        nearest = max(keep, key=lambda item: float(np.dot(point, centroids[item])))
+        labels[labels == label] = nearest
+    return labels
+
+
+def _prepare_diarization_audio(audio):
+    """Level-match proxy WAVs without touching the samples used for transcription."""
+    prepared = np.array(audio, dtype=np.float32, copy=True)
+    if prepared.size == 0:
+        return prepared
+    prepared -= float(np.mean(prepared))
+    peak = float(np.max(np.abs(prepared)))
+    if peak < 1e-5:
+        return prepared
+    if peak < 0.2 or peak > 0.98:
+        prepared *= 0.9 / peak
+    return np.clip(prepared, -1.0, 1.0)
+
+
+def _assign_param(owner, name, value):
+    if owner is None or not hasattr(owner, name):
+        return False
+    setattr(owner, name, value)
+    return True
+
+
+def _install_active_ratio(clustering, ratio):
+    current = getattr(clustering, "filter_embeddings", None)
+    if current is None:
+        return
+    if getattr(current, "_audvid_wrapped", False):
+        current._audvid_ratio = float(ratio)
+        return
+    original = current
+
+    def wrapped(embeddings, segmentations=None, min_active_ratio=None, _orig=original):
+        used = wrapped._audvid_ratio if min_active_ratio is None else min_active_ratio
+        try:
+            return _orig(embeddings, segmentations, min_active_ratio=used)
+        except TypeError:
+            return _orig(embeddings, segmentations)
+
+    wrapped._audvid_wrapped = True
+    wrapped._audvid_ratio = float(ratio)
+    clustering.filter_embeddings = wrapped
+
+
+def _configure_pipeline(model):
+    params = {
+        "segmentation": {"min_duration_off": DIAR_MIN_DURATION_OFF},
+        "clustering": {"threshold": DIAR_THRESHOLD, "Fa": DIAR_FA, "Fb": DIAR_FB},
+    }
+    try:
+        model.instantiate(params)
+    except Exception as exc:
+        print(f"[diarize] instantiate skipped: {exc}", flush=True)
+    clustering = getattr(model, "clustering", None)
+    segmentation = getattr(model, "segmentation", None)
+    _assign_param(clustering, "threshold", DIAR_THRESHOLD)
+    _assign_param(clustering, "Fa", DIAR_FA)
+    _assign_param(clustering, "Fb", DIAR_FB)
+    _assign_param(segmentation, "min_duration_off", DIAR_MIN_DURATION_OFF)
+    _install_active_ratio(clustering, DIAR_MIN_ACTIVE_RATIO)
+    print(
+        "[diarize] sensitivity "
+        f"threshold={getattr(clustering, 'threshold', None)} "
+        f"Fa={getattr(clustering, 'Fa', None)} "
+        f"Fb={getattr(clustering, 'Fb', None)} "
+        f"min_duration_off={getattr(segmentation, 'min_duration_off', None)} "
+        f"min_active_ratio={DIAR_MIN_ACTIVE_RATIO}",
+        flush=True,
+    )
+
+
+def _call_pipeline(model, audio, num_speakers, min_speakers, max_speakers):
+    waveform = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).unsqueeze(0)
+    return model(
+        {"waveform": waveform, "sample_rate": SAMPLE_RATE},
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+    )
+
+
+def _label_count(annotation):
+    if annotation is None:
+        return 0
+    try:
+        return len(list(annotation.labels()))
+    except Exception:
+        return 0
+
+
+def _best_annotation(output):
+    from pyannote.core import Annotation
+
+    if isinstance(output, Annotation):
+        return output
+    inclusive = getattr(output, "speaker_diarization", None)
+    exclusive = getattr(output, "exclusive_speaker_diarization", None)
+    if exclusive is None or len(exclusive) == 0:
+        return inclusive
+    if inclusive is None or _label_count(exclusive) >= _label_count(inclusive):
+        return exclusive
+    return inclusive
+
+
+def _probe_window_s(audio):
+    duration = len(audio) / SAMPLE_RATE
+    if duration < DIAR_WINDOW_S * 2:
+        return max(1.0, duration / 2.2)
+    return DIAR_WINDOW_S
+
+
+def _speech_spans(audio, annotation, window_s):
+    win = int(window_s * SAMPLE_RATE)
+    minimum = int(SAMPLE_RATE)
+    regions = []
+    if annotation is not None and len(annotation) > 0:
+        for segment, _, _speaker in annotation.itertracks(yield_label=True):
+            start = int(max(0.0, float(segment.start)) * SAMPLE_RATE)
+            end = int(min(len(audio) / SAMPLE_RATE, float(segment.end)) * SAMPLE_RATE)
+            start = max(0, min(start, len(audio)))
+            end = max(start, min(end, len(audio)))
+            if end - start >= minimum:
+                regions.append((start, end))
+    if not regions and len(audio) >= minimum:
+        regions.append((0, len(audio)))
+
+    spans = []
+    for start, end in regions:
+        if end - start < win:
+            spans.append((start, end))
+            continue
+        cursor = start
+        while cursor + win <= end:
+            spans.append((cursor, cursor + win))
+            cursor += win
+    if len(spans) > DIAR_MAX_WINDOWS:
+        chosen = np.linspace(0, len(spans) - 1, DIAR_MAX_WINDOWS).astype(int)
+        spans = [spans[int(index)] for index in chosen]
+    return spans
+
+
+def _embed_spans(embedding_model, audio, spans, window_s):
+    win = int(window_s * SAMPLE_RATE)
+    batch = []
+    kept = []
+    vectors = []
+
+    def flush():
+        if not batch:
+            return
+        stacked = np.stack(batch).astype(np.float32, copy=False)
+        tensor = torch.from_numpy(stacked[:, None, :])
+        embedded = np.asarray(embedding_model(tensor), dtype=np.float32)
+        if embedded.ndim == 1:
+            embedded = embedded.reshape(1, -1)
+        vectors.append(embedded)
+        batch.clear()
+
+    for start, end in spans:
+        clip = np.ascontiguousarray(audio[start:end], dtype=np.float32)
+        if clip.size < SAMPLE_RATE:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(clip))))
+        if rms < 0.008:
+            continue
+        if clip.shape[0] > win:
+            clip = clip[:win]
+        elif clip.shape[0] < win:
+            clip = np.pad(clip, (0, win - clip.shape[0]))
+        batch.append(clip)
+        kept.append((start / SAMPLE_RATE, end / SAMPLE_RATE))
+        if len(batch) >= 8:
+            flush()
+    flush()
+    if not vectors:
+        return [], None
+    return kept, np.vstack(vectors)
+
+
+def _annotation_from_spans(spans, labels):
+    from pyannote.core import Annotation, Segment
+
+    merged = []
+    for (start, end), label in zip(spans, labels):
+        label = int(label)
+        if merged and merged[-1][2] == label and start <= merged[-1][1] + 0.45:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([float(start), float(end), label])
+    order = []
+    for _start, _end, label in merged:
+        if label not in order:
+            order.append(label)
+    names = {label: f"SPEAKER_{index:02d}" for index, label in enumerate(order)}
+    annotation = Annotation()
+    for index, (start, end, label) in enumerate(merged):
+        if end - start < 0.3:
+            continue
+        annotation[Segment(start, end), index] = names[label]
+    return annotation
+
+
+def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_speakers):
+    embedding_model = getattr(model, "_embedding", None)
+    if embedding_model is None:
+        return None, 1.0, None, None
+    window_s = _probe_window_s(audio)
+    spans = _speech_spans(audio, annotation, window_s)
+    if len(spans) < 2:
+        return None, 1.0, None, None
+    kept, matrix = _embed_spans(embedding_model, audio, spans, window_s)
+    if matrix is None or len(kept) < 2:
+        return None, 1.0, None, None
+    finite = np.all(np.isfinite(matrix), axis=1)
+    if not np.all(finite):
+        kept = [span for span, ok in zip(kept, finite) if ok]
+        matrix = matrix[finite]
+    if len(kept) < 2:
+        return None, 1.0, None, None
+
+    forced = num_speakers
+    ceiling = max_speakers or DIAR_MAX_AUTO_SPEAKERS
+    if forced:
+        ceiling = forced
+        floor = forced
+    elif min_speakers and min_speakers > 1:
+        floor = min_speakers
+        ceiling = max(ceiling, min_speakers)
+    else:
+        floor = 1
+    ceiling = max(1, min(int(ceiling), len(kept), DIAR_MAX_AUTO_SPEAKERS if not forced else int(ceiling)))
+    floor = max(1, min(int(floor), ceiling))
+
+    labels, similarity = _cluster_embeddings(
+        matrix,
+        DIAR_SPLIT_DISTANCE,
+        min_clusters=floor if floor > 1 else 1,
+        max_clusters=ceiling,
+    )
+    normalized = _normalize_rows(matrix)
+    labels = _fold_short_clusters(
+        kept,
+        labels,
+        normalized,
+        DIAR_MIN_SPEAKER_S,
+        protect=floor if floor > 1 else 1,
+    )
+    labels = _compact_labels(labels)
+    similarity = _min_centroid_cosine(normalized, labels)
+    found = len(set(int(value) for value in labels))
+    distinct = found >= 2 and similarity <= DIAR_MAX_SPLIT_SIMILARITY
+    if forced and found >= 2:
+        target = found
+    elif floor > 1 and found >= 2:
+        target = found
+    elif distinct:
+        target = found
+    else:
+        target = None
+    return target, similarity, kept, labels
+
+
+def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers):
+    model = pipeline.model
+    prepared = _prepare_diarization_audio(audio)
+    _configure_pipeline(model)
+    output = _call_pipeline(model, prepared, num_speakers, min_speakers, max_speakers)
+    annotation = _best_annotation(output)
+    found = _label_count(annotation)
+    rescue = "none"
+    similarity = None
+    requested = num_speakers or 0
+    minimum = min_speakers or 0
+    collapsed = found == 1 and requested != 1 and max_speakers != 1
+    short = found >= 1 and ((requested and found < requested) or (minimum and found < minimum))
+    if collapsed or short:
+        try:
+            target, similarity, spans, labels = _probe_speakers(
+                model, prepared, annotation, num_speakers, min_speakers, max_speakers
+            )
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except Exception as exc:
+            print(f"[diarize] speaker probe skipped: {type(exc).__name__}: {exc}", flush=True)
+            target, spans, labels = None, None, None
+        if target and target > found:
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            retried = None
+            try:
+                retried = _best_annotation(
+                    _call_pipeline(model, prepared, target, target, target)
+                )
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except Exception as exc:
+                print(f"[diarize] recount skipped: {type(exc).__name__}: {exc}", flush=True)
+            if _label_count(retried) >= 2:
+                annotation = retried
+                rescue = "num_speakers"
+            elif spans is not None and labels is not None and len(set(int(v) for v in labels)) >= 2:
+                annotation = _annotation_from_spans(spans, labels)
+                rescue = "windows"
+    final = _label_count(annotation)
+    print(
+        f"[diarize] speakers {found} -> {final} rescue={rescue} "
+        f"similarity={None if similarity is None else round(similarity, 3)}",
+        flush=True,
+    )
+    return annotation, rescue
+
+
+def _rows_from_annotation(annotation):
+    rows = []
+    if annotation is None:
+        return rows
+    for segment, _, speaker in annotation.itertracks(yield_label=True):
+        start = float(segment.start)
+        end = float(segment.end)
+        if end - start < 0.05 or speaker is None or speaker == "":
+            continue
+        rows.append({"start": round(start, 3), "end": round(end, 3), "speaker": str(speaker)})
+    return rows
+
+
+def _fill_word_speakers(segments, rows):
+    if not rows:
+        return segments
+    for segment in segments:
+        for word in segment.get("words") or []:
+            if word.get("speaker") or word.get("start") is None:
+                continue
+            start = float(word["start"])
+            end = float(word["end"]) if word.get("end") is not None else start
+            mid = (start + end) / 2.0
+            best = None
+            best_overlap = 0.0
+            nearest = None
+            nearest_distance = 1e9
+            for row in rows:
+                overlap = min(end, row["end"]) - max(start, row["start"])
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best = row["speaker"]
+                if row["start"] <= mid <= row["end"]:
+                    distance = 0.0
+                else:
+                    distance = min(abs(mid - row["start"]), abs(mid - row["end"]))
+                if distance < nearest_distance:
+                    nearest_distance = distance
+                    nearest = row["speaker"]
+            chosen = best or nearest
+            if chosen:
+                word["speaker"] = chosen
+    return segments
+
+
+def _split_segments_by_speaker(segments):
+    split = []
+    for segment in segments:
+        words = list(segment.get("words") or [])
+        tagged = [word.get("speaker") for word in words if word.get("speaker")]
+        if len(set(tagged)) <= 1:
+            updated = dict(segment)
+            if tagged:
+                updated["speaker"] = tagged[0]
+            split.append(updated)
+            continue
+        group = []
+        group_speaker = None
+
+        def flush():
+            if not group:
+                return
+            start = next((word.get("start") for word in group if word.get("start") is not None), segment.get("start"))
+            end = next((word.get("end") for word in reversed(group) if word.get("end") is not None), segment.get("end"))
+            text = " ".join(
+                str(word.get("word") or word.get("text") or "").strip() for word in group
+            ).strip()
+            piece = dict(segment)
+            piece["start"] = start
+            piece["end"] = end
+            piece["text"] = text or segment.get("text", "")
+            piece["speaker"] = group_speaker
+            piece["words"] = list(group)
+            split.append(piece)
+
+        for word in words:
+            speaker = word.get("speaker") or group_speaker
+            if group and speaker != group_speaker:
+                flush()
+                group = []
+                group_speaker = speaker
+            if not group:
+                group_speaker = speaker
+            group.append(word)
+        flush()
+    return split
+
+
+def _collect_speakers(segments, rows):
+    found = set()
+    for row in rows:
+        if row.get("speaker"):
+            found.add(str(row["speaker"]))
+    for segment in segments:
+        if segment.get("speaker"):
+            found.add(str(segment["speaker"]))
+        for word in segment.get("words") or []:
+            if word.get("speaker"):
+                found.add(str(word["speaker"]))
+    return sorted(found)
+
+
+def _assign_speakers(result, annotation):
+    rows = _rows_from_annotation(annotation)
+    if not rows or not result.get("segments"):
+        return result, rows
+    frame = pd.DataFrame(rows)
+    assigned = whisperx.assign_word_speakers(frame, result, fill_nearest=True)
+    assigned["segments"] = _split_segments_by_speaker(
+        _fill_word_speakers(assigned.get("segments") or [], rows)
+    )
+    return assigned, rows
+
+
 def handler(job):
     job_input = job.get("input") or {}
     source = job_input.get("audio_file") or job_input.get("audio_url") or job_input.get("audio_base64")
@@ -122,7 +677,7 @@ def handler(job):
             t = time.time()
             audio = whisperx.load_audio(_materialize_audio(source, workdir))
             timings["load_audio_s"] = round(time.time() - t, 2)
-        duration_s = round(len(audio) / 16000, 2)
+        duration_s = round(len(audio) / SAMPLE_RATE, 2)
 
         t = time.time()
         result = ASR_MODEL.transcribe(audio, batch_size=batch_size, language=language, task=task)
@@ -141,17 +696,21 @@ def handler(job):
             timings["align_s"] = round(time.time() - t, 2)
 
         speakers = []
+        diarization_rows = []
         if diarization and result["segments"]:
             t = time.time()
-            diarize_segments = _get_diarize_pipeline(hf_token)(
+            annotation, rescue = _separate_speakers(
+                _get_diarize_pipeline(hf_token),
                 audio,
                 num_speakers=_optional_int(job_input, "num_speakers"),
                 min_speakers=_optional_int(job_input, "min_speakers"),
                 max_speakers=_optional_int(job_input, "max_speakers"),
             )
-            result = whisperx.assign_word_speakers(diarize_segments, result)
-            speakers = sorted({s["speaker"] for s in result["segments"] if s.get("speaker")})
+            result, diarization_rows = _assign_speakers(result, annotation)
+            speakers = _collect_speakers(result.get("segments") or [], diarization_rows)
             timings["diarize_s"] = round(time.time() - t, 2)
+            timings["diarize_rescue"] = rescue
+            timings["diarize_speakers"] = len(speakers)
 
         segments = result.get("segments", [])
         return _clean(
@@ -161,6 +720,8 @@ def handler(job):
                 "detected_language": detected_language,
                 "language_probability": None,
                 "speakers": speakers,
+                "diarization": diarization_rows,
+                "exclusive_diarization": diarization_rows,
                 "duration_s": duration_s,
                 "timings": timings,
                 "model": WHISPER_MODEL,
