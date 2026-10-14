@@ -44,6 +44,10 @@ DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
 DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
 DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
 DIAR_MAX_AUTO_SPEAKERS = int(os.environ.get("DIARIZATION_MAX_AUTO_SPEAKERS", "8"))
+# Bounds sent to pyannote on every call when the request does not set them. A file
+# with one real voice will be split in two unless the request sends min_speakers=1.
+DIAR_DEFAULT_MIN_SPEAKERS = int(os.environ.get("DIARIZATION_MIN_SPEAKERS", "2"))
+DIAR_DEFAULT_MAX_SPEAKERS = int(os.environ.get("DIARIZATION_MAX_SPEAKERS", "8"))
 
 print(f"[init] device={DEVICE} compute_type={COMPUTE_TYPE} model={WHISPER_MODEL_PATH}", flush=True)
 _t0 = time.time()
@@ -100,6 +104,32 @@ def _materialize_audio(source, workdir):
     with open(path, "wb") as fh:
         fh.write(data)
     return path
+
+
+def _load_mono_16k(path):
+    """Decode to one channel at 16 kHz explicitly; whisperx/ffmpeg is the fallback decoder."""
+    try:
+        import torchaudio
+
+        waveform, sample_rate = torchaudio.load(path)
+        channels = int(waveform.shape[0])
+        if channels > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+        if sample_rate != SAMPLE_RATE:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=SAMPLE_RATE)
+            waveform = resampler(waveform)
+        audio = waveform.squeeze(0).contiguous().numpy().astype(np.float32, copy=False)
+        print(
+            f"[audio] torchaudio source_sr={sample_rate} channels={channels} -> "
+            f"mono sr={SAMPLE_RATE} samples={audio.shape[0]}",
+            flush=True,
+        )
+        return audio, {"decoder": "torchaudio", "source_sr": int(sample_rate), "source_channels": channels}
+    except Exception as exc:
+        print(f"[audio] torchaudio load failed, using ffmpeg: {type(exc).__name__}: {exc}", flush=True)
+    audio = whisperx.load_audio(path).astype(np.float32, copy=False)
+    print(f"[audio] ffmpeg -> mono sr={SAMPLE_RATE} samples={audio.shape[0]}", flush=True)
+    return audio, {"decoder": "ffmpeg", "source_sr": None, "source_channels": None}
 
 
 def _clean(value):
@@ -313,9 +343,11 @@ def _install_active_ratio(clustering, ratio):
     def wrapped(embeddings, segmentations=None, min_active_ratio=None, _orig=original):
         used = wrapped._audvid_ratio if min_active_ratio is None else min_active_ratio
         try:
-            return _orig(embeddings, segmentations, min_active_ratio=used)
+            kept = _orig(embeddings, segmentations, min_active_ratio=used)
         except TypeError:
-            return _orig(embeddings, segmentations)
+            kept = _orig(embeddings, segmentations)
+        _record_clustering_input(embeddings, kept, used)
+        return kept
 
     wrapped._audvid_wrapped = True
     wrapped._audvid_ratio = float(ratio)
@@ -350,14 +382,116 @@ def _configure_pipeline(model):
     )
 
 
+_diag_runs = []
+
+
+def _diag_current():
+    if not _diag_runs:
+        _diag_runs.append({})
+    return _diag_runs[-1]
+
+
+def _record_clustering_input(embeddings, kept, ratio):
+    diag = _diag_current()
+    try:
+        train = kept[0] if isinstance(kept, tuple) else kept
+        total = int(embeddings.shape[0] * embeddings.shape[1])
+        valid = int(np.sum(~np.any(np.isnan(embeddings), axis=2)))
+        diag["clustering_input"] = int(train.shape[0])
+        diag["embeddings_total"] = total
+        diag["embeddings_valid"] = valid
+        print(
+            f"[diarize] before clustering: embeddings total={total} valid={valid} "
+            f"kept_for_clustering={int(train.shape[0])} min_active_ratio={ratio}",
+            flush=True,
+        )
+        if int(train.shape[0]) < 2:
+            print(
+                "[diarize] WARNING fewer than 2 embeddings reach clustering; "
+                "pyannote will return a single speaker",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[diarize] clustering-input log failed: {exc}", flush=True)
+
+
+def _diagnostic_hook(step_name, step_artifact, file=None, total=None, completed=None):
+    if completed is not None or step_artifact is None:
+        return
+    diag = _diag_current()
+    try:
+        if step_name == "segmentation":
+            chunks, frames, local = step_artifact.data.shape
+            active = int(np.sum(np.nanmax(step_artifact.data, axis=1) > 0.5))
+            diag["segmentation_chunks"] = int(chunks)
+            diag["segmentation_local_speakers"] = int(local)
+            diag["segmentation_active_tracks"] = active
+            print(
+                f"[diarize] segmentation: chunks={chunks} frames_per_chunk={frames} "
+                f"local_speakers={local} active_chunk_speakers={active}",
+                flush=True,
+            )
+        elif step_name == "speaker_counting":
+            data = np.asarray(step_artifact.data)
+            step = float(step_artifact.sliding_window.step)
+            speech_s = round(float(np.sum(data >= 1)) * step, 2)
+            overlap_s = round(float(np.sum(data >= 2)) * step, 2)
+            diag["speech_s"] = speech_s
+            diag["overlap_s"] = overlap_s
+            diag["max_simultaneous"] = int(np.nanmax(data)) if data.size else 0
+            print(
+                f"[diarize] speaker counting: speech={speech_s}s overlap={overlap_s}s "
+                f"max_simultaneous={diag['max_simultaneous']}",
+                flush=True,
+            )
+        elif step_name == "embeddings":
+            shape = tuple(int(v) for v in np.shape(step_artifact))
+            nan_rows = int(np.sum(np.any(np.isnan(step_artifact), axis=-1))) if len(shape) == 3 else -1
+            diag["embeddings_shape"] = list(shape)
+            diag["embeddings_nan"] = nan_rows
+            print(f"[diarize] embeddings: shape={shape} nan_rows={nan_rows}", flush=True)
+        elif step_name == "discrete_diarization":
+            data = np.asarray(step_artifact.data)
+            speakers = int(np.sum(np.nanmax(data, axis=0) > 0)) if data.size else 0
+            diag["clustered_speakers"] = speakers
+            print(f"[diarize] after clustering: speakers={speakers}", flush=True)
+    except Exception as exc:
+        print(f"[diarize] hook log failed at {step_name}: {exc}", flush=True)
+
+
 def _call_pipeline(model, audio, num_speakers, min_speakers, max_speakers):
-    waveform = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).unsqueeze(0)
+    waveform = torch.from_numpy(np.ascontiguousarray(audio, dtype=np.float32)).reshape(1, -1)
+    _diag_runs.append(
+        {
+            "num_speakers": num_speakers,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+            "waveform_shape": list(waveform.shape),
+            "sample_rate": SAMPLE_RATE,
+        }
+    )
+    print(
+        f"[diarize] pipeline input waveform={tuple(waveform.shape)} sr={SAMPLE_RATE} "
+        f"num_speakers={num_speakers} min_speakers={min_speakers} max_speakers={max_speakers}",
+        flush=True,
+    )
     return model(
         {"waveform": waveform, "sample_rate": SAMPLE_RATE},
         num_speakers=num_speakers,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
+        hook=_diagnostic_hook,
     )
+
+
+def _speaker_bounds(num_speakers, min_speakers, max_speakers):
+    if num_speakers:
+        return int(num_speakers), int(num_speakers), int(num_speakers)
+    low = int(min_speakers) if min_speakers else DIAR_DEFAULT_MIN_SPEAKERS
+    high = int(max_speakers) if max_speakers else DIAR_DEFAULT_MAX_SPEAKERS
+    low = max(1, low)
+    high = max(low, high)
+    return None, low, high
 
 
 def _label_count(annotation):
@@ -543,6 +677,8 @@ def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_sp
 
 def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers):
     model = pipeline.model
+    _diag_runs.clear()
+    num_speakers, min_speakers, max_speakers = _speaker_bounds(num_speakers, min_speakers, max_speakers)
     prepared = _prepare_diarization_audio(audio)
     _configure_pipeline(model)
     output = _call_pipeline(model, prepared, num_speakers, min_speakers, max_speakers)
@@ -728,8 +864,9 @@ def handler(job):
     try:
         with tempfile.TemporaryDirectory() as workdir:
             t = time.time()
-            audio = whisperx.load_audio(_materialize_audio(source, workdir))
+            audio, audio_info = _load_mono_16k(_materialize_audio(source, workdir))
             timings["load_audio_s"] = round(time.time() - t, 2)
+            timings["audio"] = audio_info
         duration_s = round(len(audio) / SAMPLE_RATE, 2)
 
         t = time.time()
@@ -767,6 +904,7 @@ def handler(job):
             timings["diarize_threshold"] = DIAR_THRESHOLD
             timings["diarize_fb"] = DIAR_FB
             timings["diarize_active_ratio"] = DIAR_MIN_ACTIVE_RATIO
+            timings["diarize_debug"] = list(_diag_runs)
 
         segments = result.get("segments", [])
         return _clean(
