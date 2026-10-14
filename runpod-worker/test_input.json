@@ -1,0 +1,8 @@
+{
+  "input": {
+    "audio_file": "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav",
+    "language": "en",
+    "align_output": true,
+    "diarization": false
+  }
+}

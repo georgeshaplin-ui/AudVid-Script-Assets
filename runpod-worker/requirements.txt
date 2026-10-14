@@ -1,0 +1,7 @@
+# torch / torchaudio / torchvision are installed separately from the cu128 index (see Dockerfile).
+whisperx==3.8.6
+pyannote.audio==4.0.7
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+huggingface-hub>=0.28.1,<1.0.0
+runpod==1.12.0

@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!requirements.txt
+!download_models.py
+!handler.py
