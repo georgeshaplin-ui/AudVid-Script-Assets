@@ -1,0 +1,62 @@
+name: dockerhub make image public
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Docker Hub repository name (without namespace)
+        default: audvid-whisperx
+      expected_namespace:
+        description: Namespace to compare against DOCKERHUB_USERNAME (reported as match / mismatch only)
+        default: georgeshaplin
+
+jobs:
+  make-public:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make repository public and verify anonymous pull
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          REPO: ${{ inputs.repository }}
+          EXPECTED: ${{ inputs.expected_namespace }}
+        run: |
+          set -euo pipefail
+          if [ "$DH_USER" = "$EXPECTED" ]; then echo "NAMESPACE_MATCH=yes"; else echo "NAMESPACE_MATCH=no"; fi
+
+          JWT=$(curl -fsS -X POST https://hub.docker.com/v2/auth/token \
+                  -H 'Content-Type: application/json' \
+                  -d "{\"identifier\":\"$DH_USER\",\"secret\":\"$DH_TOKEN\"}" | jq -r '.access_token // empty')
+          if [ -z "$JWT" ]; then
+            JWT=$(curl -fsS -X POST https://hub.docker.com/v2/users/login \
+                    -H 'Content-Type: application/json' \
+                    -d "{\"username\":\"$DH_USER\",\"password\":\"$DH_TOKEN\"}" | jq -r '.token // empty')
+          fi
+          [ -n "$JWT" ] || { echo "LOGIN_FAILED"; exit 1; }
+
+          BEFORE=$(curl -fsS "https://hub.docker.com/v2/repositories/$DH_USER/$REPO/" -H "Authorization: Bearer $JWT" | jq -r '.is_private')
+          echo "IS_PRIVATE_BEFORE=$BEFORE"
+
+          CODE=$(curl -sS -o /tmp/privacy.json -w '%{http_code}' -X POST \
+                   "https://hub.docker.com/v2/repositories/$DH_USER/$REPO/privacy/" \
+                   -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+                   -d '{"is_private":false}')
+          echo "PRIVACY_HTTP=$CODE"; cat /tmp/privacy.json; echo
+          if [ "$CODE" -ge 300 ]; then
+            CODE=$(curl -sS -o /tmp/patch.json -w '%{http_code}' -X PATCH \
+                     "https://hub.docker.com/v2/repositories/$DH_USER/$REPO/" \
+                     -H "Authorization: Bearer $JWT" -H 'Content-Type: application/json' \
+                     -d '{"is_private":false}')
+            echo "PATCH_HTTP=$CODE"; cat /tmp/patch.json; echo
+          fi
+
+          AFTER=$(curl -fsS "https://hub.docker.com/v2/repositories/$DH_USER/$REPO/" -H "Authorization: Bearer $JWT" | jq -r '.is_private')
+          echo "IS_PRIVATE_AFTER=$AFTER"
+
+          ANON=$(curl -fsS "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$DH_USER/$REPO:pull" | jq -r .token)
+          PULL=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+                   -H "Authorization: Bearer $ANON" \
+                   -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                   "https://registry-1.docker.io/v2/$DH_USER/$REPO/manifests/latest")
+          echo "ANONYMOUS_PULL_HTTP=$PULL"
+          [ "$AFTER" = "false" ] && [ "$PULL" = "200" ]
