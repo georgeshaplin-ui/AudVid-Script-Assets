@@ -245,8 +245,12 @@ def _prepare_diarization_audio(audio):
 def _assign_param(owner, name, value):
     if owner is None or not hasattr(owner, name):
         return False
-    setattr(owner, name, value)
-    return True
+    try:
+        setattr(owner, name, value)
+        return True
+    except Exception as exc:
+        print(f"[diarize] could not set {name}: {exc}", flush=True)
+        return False
 
 
 def _install_active_ratio(clustering, ratio):
