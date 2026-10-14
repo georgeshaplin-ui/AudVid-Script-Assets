@@ -25,28 +25,24 @@ DOWNLOAD_TIMEOUT_S = int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120"))
 DIARIZATION_CACHE = "/runpod-volume/hf" if os.path.isdir("/runpod-volume") else None
 SAMPLE_RATE = 16000
 
-# Maximum speaker separation for proxy audio: fast turns, pauses under a second,
-# and background noise. community-1 ships at threshold 0.60 / Fb 0.80, which merges
-# those voices. Lower distance and Fb keep more speakers; higher Fa trusts the
-# acoustics. Values sit at the edge of the VBx search range on purpose.
-DIAR_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.35"))
+# Speaker identity is cosine distance in embedding space only. No pause, duration,
+# or temporal smoothing is used to merge or split voices.
+# community-1 VBx AHC uses euclidean distance on unit vectors: 0.12 ≈ cosine 0.993.
+DIAR_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.12"))
 DIAR_FA = float(os.environ.get("DIARIZATION_FA", "0.50"))
-DIAR_FB = float(os.environ.get("DIARIZATION_FB", "0.02"))
-DIAR_MIN_DURATION_OFF = float(os.environ.get("DIARIZATION_MIN_DURATION_OFF", "0.0"))
-# Stock pyannote drops a voice unless it owns 20% of a 10s chunk alone, so a short
-# reply never gets an embedding and the whole file becomes SPEAKER_00.
-DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.02"))
-# Euclidean distance on unit embeddings. 0.38 ≈ cosine 0.93, so only near-identical
-# windows stay in one cluster.
-DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.38"))
-DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.96"))
-DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
-DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
-DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
+DIAR_FB = float(os.environ.get("DIARIZATION_FB", "0.01"))
+DIAR_MIN_DURATION_OFF = 0.0
+DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.01"))
+# sklearn cosine distance = 1 - cosine similarity. 0.05 keeps a cluster only when
+# embeddings are almost the same vector; anything looser becomes a new SPEAKER.
+DIAR_COSINE_DISTANCE = float(os.environ.get("DIARIZATION_COSINE_DISTANCE", "0.05"))
+DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "0.50"))
+DIAR_HOP_S = float(os.environ.get("DIARIZATION_HOP_S", "0.25"))
+DIAR_MIN_EMBED_S = float(os.environ.get("DIARIZATION_MIN_EMBED_S", "0.40"))
+DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "240"))
+DIAR_SEGMENTATION_STEP = float(os.environ.get("DIARIZATION_SEGMENTATION_STEP", "0.04"))
 DIAR_MAX_AUTO_SPEAKERS = int(os.environ.get("DIARIZATION_MAX_AUTO_SPEAKERS", "8"))
-# Bounds sent to pyannote on every call when the request does not set them. A file
-# with one real voice will be split in two unless the request sends min_speakers=1.
-DIAR_DEFAULT_MIN_SPEAKERS = int(os.environ.get("DIARIZATION_MIN_SPEAKERS", "2"))
+DIAR_DEFAULT_MIN_SPEAKERS = int(os.environ.get("DIARIZATION_MIN_SPEAKERS", "1"))
 DIAR_DEFAULT_MAX_SPEAKERS = int(os.environ.get("DIARIZATION_MAX_SPEAKERS", "8"))
 
 print(f"[init] device={DEVICE} compute_type={COMPUTE_TYPE} model={WHISPER_MODEL_PATH}", flush=True)
@@ -200,18 +196,14 @@ def _merge_to_max(matrix, labels, max_clusters):
     return _compact_labels(labels)
 
 
-def _kmeans_labels(matrix, n_clusters):
-    from sklearn.cluster import KMeans
-
-    return KMeans(n_clusters=int(n_clusters), n_init=10, random_state=0).fit_predict(matrix).astype(int)
-
-
 def _cluster_embeddings(matrix, distance_threshold, min_clusters=1, max_clusters=8):
-    """Cluster speaker embeddings.
+    """Agglomerative clustering on speaker embeddings only (cosine, complete linkage).
 
-    Rows are L2-normalized. Returns labels starting at 0 and the lowest cosine
-    similarity between cluster centroids (1.0 when a single cluster remains).
+    A new speaker is created as soon as cosine distance exceeds the threshold.
+    Time, duration, and pauses are not used.
     """
+    from sklearn.cluster import AgglomerativeClustering
+
     matrix = _normalize_rows(matrix)
     count = int(matrix.shape[0]) if matrix.ndim == 2 else 0
     if count == 0:
@@ -221,39 +213,15 @@ def _cluster_embeddings(matrix, distance_threshold, min_clusters=1, max_clusters
     if count == 1 or max_clusters == 1:
         return np.zeros(count, dtype=int), 1.0
 
-    if min_clusters >= 2 and min_clusters == max_clusters:
-        labels = _kmeans_labels(matrix, min_clusters)
-    else:
-        from scipy.cluster.hierarchy import fcluster, linkage
-
-        linked = linkage(matrix, method="average", metric="euclidean")
-        raw = fcluster(linked, t=float(distance_threshold), criterion="distance")
-        labels = _merge_to_max(matrix, _compact_labels(raw), max_clusters)
-        if len(set(int(value) for value in labels)) < min_clusters:
-            labels = _kmeans_labels(matrix, min_clusters)
+    kwargs = dict(n_clusters=None, linkage="complete", distance_threshold=float(distance_threshold))
+    try:
+        model = AgglomerativeClustering(metric="cosine", **kwargs)
+    except TypeError:
+        model = AgglomerativeClustering(affinity="cosine", **kwargs)
+    labels = _compact_labels(model.fit_predict(matrix).astype(int))
+    if len(set(int(value) for value in labels)) > max_clusters:
+        labels = _merge_to_max(matrix, labels, max_clusters)
     return _compact_labels(labels), _min_centroid_cosine(matrix, labels)
-
-
-def _fold_short_clusters(spans, labels, matrix, min_seconds, protect=1):
-    labels = np.asarray(labels, dtype=int).copy()
-    durations = {}
-    for label, (start, end) in zip(labels, spans):
-        durations[int(label)] = durations.get(int(label), 0.0) + max(0.0, float(end) - float(start))
-    keep = [label for label, duration in durations.items() if duration >= min_seconds]
-    if len(keep) < max(1, int(protect)) or len(keep) == len(durations):
-        return labels
-    centroids = {}
-    for label in keep:
-        centroid = matrix[labels == label].mean(axis=0)
-        centroids[label] = centroid / max(np.linalg.norm(centroid), 1e-8)
-    for label, duration in durations.items():
-        if duration >= min_seconds or not np.any(labels == label):
-            continue
-        point = matrix[labels == label].mean(axis=0)
-        point = point / max(np.linalg.norm(point), 1e-8)
-        nearest = max(keep, key=lambda item: float(np.dot(point, centroids[item])))
-        labels[labels == label] = nearest
-    return labels
 
 
 def _highpass(audio):
@@ -354,9 +322,28 @@ def _install_active_ratio(clustering, ratio):
     clustering.filter_embeddings = wrapped
 
 
+def _install_fine_segmentation(model, step_ratio):
+    """Shorter hops between pyannote windows so embeddings track fast speaker changes."""
+    model.segmentation_step = step_ratio
+    inference = getattr(model, "_segmentation", None)
+    duration = getattr(inference, "duration", None)
+    if inference is None or not duration:
+        return
+    hop = float(duration) * float(step_ratio)
+    if hasattr(inference, "step"):
+        inference.step = hop
+    window = getattr(inference, "sliding_window", None)
+    if window is not None and hasattr(window, "step"):
+        try:
+            window.step = hop
+        except Exception:
+            pass
+    print(f"[diarize] embedding windows duration={duration:.2f}s hop={hop:.2f}s", flush=True)
+
+
 def _configure_pipeline(model):
     params = {
-        "segmentation": {"min_duration_off": DIAR_MIN_DURATION_OFF},
+        "segmentation": {"min_duration_off": 0.0},
         "clustering": {"threshold": DIAR_THRESHOLD, "Fa": DIAR_FA, "Fb": DIAR_FB},
     }
     try:
@@ -368,15 +355,18 @@ def _configure_pipeline(model):
     _assign_param(clustering, "threshold", DIAR_THRESHOLD)
     _assign_param(clustering, "Fa", DIAR_FA)
     _assign_param(clustering, "Fb", DIAR_FB)
+    _assign_param(clustering, "method", "complete")
     _assign_param(segmentation, "min_duration_off", 0.0)
     _assign_param(segmentation, "min_duration_on", 0.0)
     _install_active_ratio(clustering, DIAR_MIN_ACTIVE_RATIO)
+    _install_fine_segmentation(model, DIAR_SEGMENTATION_STEP)
     print(
-        "[diarize] sensitivity "
-        f"threshold={getattr(clustering, 'threshold', None)} "
+        "[diarize] embedding clustering "
+        f"ahc_threshold={getattr(clustering, 'threshold', None)} "
+        f"cosine_distance={DIAR_COSINE_DISTANCE} "
         f"Fa={getattr(clustering, 'Fa', None)} "
         f"Fb={getattr(clustering, 'Fb', None)} "
-        f"min_duration_off={getattr(segmentation, 'min_duration_off', None)} "
+        f"min_duration_on=0 min_duration_off=0 "
         f"min_active_ratio={DIAR_MIN_ACTIVE_RATIO}",
         flush=True,
     )
@@ -517,16 +507,10 @@ def _best_annotation(output):
     return inclusive
 
 
-def _probe_window_s(audio):
-    duration = len(audio) / SAMPLE_RATE
-    if duration < DIAR_WINDOW_S * 2:
-        return max(1.0, duration / 2.2)
-    return DIAR_WINDOW_S
-
-
 def _speech_spans(audio, annotation, window_s):
-    win = int(window_s * SAMPLE_RATE)
-    minimum = int(SAMPLE_RATE)
+    win = max(int(window_s * SAMPLE_RATE), int(DIAR_MIN_EMBED_S * SAMPLE_RATE))
+    hop = max(int(DIAR_HOP_S * SAMPLE_RATE), win // 2)
+    minimum = int(DIAR_MIN_EMBED_S * SAMPLE_RATE)
     regions = []
     if annotation is not None and len(annotation) > 0:
         for segment, _, _speaker in annotation.itertracks(yield_label=True):
@@ -541,13 +525,17 @@ def _speech_spans(audio, annotation, window_s):
 
     spans = []
     for start, end in regions:
-        if end - start < win:
+        if end - start <= win:
             spans.append((start, end))
             continue
         cursor = start
-        while cursor + win <= end:
-            spans.append((cursor, cursor + win))
-            cursor += win
+        while cursor < end:
+            stop = min(cursor + win, end)
+            if stop - cursor >= minimum:
+                spans.append((cursor, stop))
+            if stop >= end:
+                break
+            cursor += hop
     if len(spans) > DIAR_MAX_WINDOWS:
         chosen = np.linspace(0, len(spans) - 1, DIAR_MAX_WINDOWS).astype(int)
         spans = [spans[int(index)] for index in chosen]
@@ -573,10 +561,9 @@ def _embed_spans(embedding_model, audio, spans, window_s):
 
     for start, end in spans:
         clip = np.ascontiguousarray(audio[start:end], dtype=np.float32)
-        if clip.size < SAMPLE_RATE:
+        if clip.size < int(DIAR_MIN_EMBED_S * SAMPLE_RATE):
             continue
-        rms = float(np.sqrt(np.mean(np.square(clip))))
-        if rms < 0.008:
+        if not np.any(np.isfinite(clip)) or float(np.max(np.abs(clip))) < 1e-6:
             continue
         if clip.shape[0] > win:
             clip = clip[:win]
@@ -598,10 +585,12 @@ def _annotation_from_spans(spans, labels):
     merged = []
     for (start, end), label in zip(spans, labels):
         label = int(label)
-        if merged and merged[-1][2] == label and start <= merged[-1][1] + 0.45:
+        start, end = float(start), float(end)
+        # Adjacent same-embedding windows may touch; never fill a gap in time.
+        if merged and merged[-1][2] == label and start <= merged[-1][1] + 1e-3:
             merged[-1][1] = max(merged[-1][1], end)
         else:
-            merged.append([float(start), float(end), label])
+            merged.append([start, end, label])
     order = []
     for _start, _end, label in merged:
         if label not in order:
@@ -609,7 +598,7 @@ def _annotation_from_spans(spans, labels):
     names = {label: f"SPEAKER_{index:02d}" for index, label in enumerate(order)}
     annotation = Annotation()
     for index, (start, end, label) in enumerate(merged):
-        if end - start < 0.3:
+        if end <= start:
             continue
         annotation[Segment(start, end), index] = names[label]
     return annotation
@@ -619,7 +608,7 @@ def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_sp
     embedding_model = getattr(model, "_embedding", None)
     if embedding_model is None:
         return None, 1.0, None, None
-    window_s = _probe_window_s(audio)
+    window_s = DIAR_WINDOW_S
     spans = _speech_spans(audio, annotation, window_s)
     if len(spans) < 2:
         return None, 1.0, None, None
@@ -633,45 +622,23 @@ def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_sp
     if len(kept) < 2:
         return None, 1.0, None, None
 
-    forced = num_speakers
-    ceiling = max_speakers or DIAR_MAX_AUTO_SPEAKERS
-    if forced:
-        ceiling = forced
-        floor = forced
-    elif min_speakers and min_speakers > 1:
-        floor = min_speakers
-        ceiling = max(ceiling, min_speakers)
-    else:
-        floor = 1
-    ceiling = max(1, min(int(ceiling), len(kept), DIAR_MAX_AUTO_SPEAKERS if not forced else int(ceiling)))
-    floor = max(1, min(int(floor), ceiling))
+    ceiling = num_speakers or max_speakers or DIAR_MAX_AUTO_SPEAKERS
+    ceiling = max(1, min(int(ceiling), len(kept), DIAR_MAX_AUTO_SPEAKERS))
 
     labels, similarity = _cluster_embeddings(
         matrix,
-        DIAR_SPLIT_DISTANCE,
-        min_clusters=floor if floor > 1 else 1,
+        DIAR_COSINE_DISTANCE,
+        min_clusters=1,
         max_clusters=ceiling,
     )
-    normalized = _normalize_rows(matrix)
-    labels = _fold_short_clusters(
-        kept,
-        labels,
-        normalized,
-        DIAR_MIN_SPEAKER_S,
-        protect=floor if floor > 1 else 1,
-    )
     labels = _compact_labels(labels)
-    similarity = _min_centroid_cosine(normalized, labels)
     found = len(set(int(value) for value in labels))
-    distinct = found >= 2 and similarity <= DIAR_MAX_SPLIT_SIMILARITY
-    if forced and found >= 2:
-        target = found
-    elif floor > 1 and found >= 2:
-        target = found
-    elif distinct:
-        target = found
-    else:
-        target = None
+    print(
+        f"[diarize] embedding agglomerative windows={len(kept)} speakers={found} "
+        f"cosine_distance={DIAR_COSINE_DISTANCE} centroid_similarity={round(similarity, 4)}",
+        flush=True,
+    )
+    target = found if found >= 1 else None
     return target, similarity, kept, labels
 
 
@@ -684,43 +651,23 @@ def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers
     output = _call_pipeline(model, prepared, num_speakers, min_speakers, max_speakers)
     annotation = _best_annotation(output)
     found = _label_count(annotation)
-    rescue = "none"
+    rescue = "pipeline"
     similarity = None
-    requested = num_speakers or 0
-    minimum = min_speakers or 0
-    collapsed = found == 1 and requested != 1 and max_speakers != 1
-    short = found >= 1 and ((requested and found < requested) or (minimum and found < minimum))
-    if collapsed or short:
-        try:
-            target, similarity, spans, labels = _probe_speakers(
-                model, prepared, annotation, num_speakers, min_speakers, max_speakers
-            )
-        except torch.cuda.OutOfMemoryError:
-            raise
-        except Exception as exc:
-            print(f"[diarize] speaker probe skipped: {type(exc).__name__}: {exc}", flush=True)
-            target, spans, labels = None, None, None
-        if target and target > found:
-            if DEVICE == "cuda":
-                torch.cuda.empty_cache()
-            retried = None
-            try:
-                retried = _best_annotation(
-                    _call_pipeline(model, prepared, target, target, target)
-                )
-            except torch.cuda.OutOfMemoryError:
-                raise
-            except Exception as exc:
-                print(f"[diarize] recount skipped: {type(exc).__name__}: {exc}", flush=True)
-            if _label_count(retried) >= 2:
-                annotation = retried
-                rescue = "num_speakers"
-            elif spans is not None and labels is not None and len(set(int(v) for v in labels)) >= 2:
-                annotation = _annotation_from_spans(spans, labels)
-                rescue = "windows"
+    try:
+        _target, similarity, spans, labels = _probe_speakers(
+            model, prepared, annotation, num_speakers, min_speakers, max_speakers
+        )
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as exc:
+        print(f"[diarize] embedding clustering skipped: {type(exc).__name__}: {exc}", flush=True)
+        spans, labels = None, None
+    if spans is not None and labels is not None and len(labels) > 0:
+        annotation = _annotation_from_spans(spans, labels)
+        rescue = "embeddings"
     final = _label_count(annotation)
     print(
-        f"[diarize] speakers {found} -> {final} rescue={rescue} "
+        f"[diarize] speakers pipeline={found} embeddings={final} source={rescue} "
         f"similarity={None if similarity is None else round(similarity, 3)}",
         flush=True,
     )
@@ -734,7 +681,7 @@ def _rows_from_annotation(annotation):
     for segment, _, speaker in annotation.itertracks(yield_label=True):
         start = float(segment.start)
         end = float(segment.end)
-        if end - start < 0.05 or speaker is None or speaker == "":
+        if end <= start or speaker is None or speaker == "":
             continue
         rows.append({"start": round(start, 3), "end": round(end, 3), "speaker": str(speaker)})
     return rows
@@ -902,6 +849,9 @@ def handler(job):
             timings["diarize_rescue"] = rescue
             timings["diarize_speakers"] = len(speakers)
             timings["diarize_threshold"] = DIAR_THRESHOLD
+            timings["diarize_cosine_distance"] = DIAR_COSINE_DISTANCE
+            timings["diarize_window_s"] = DIAR_WINDOW_S
+            timings["diarize_hop_s"] = DIAR_HOP_S
             timings["diarize_fb"] = DIAR_FB
             timings["diarize_active_ratio"] = DIAR_MIN_ACTIVE_RATIO
             timings["diarize_debug"] = list(_diag_runs)
