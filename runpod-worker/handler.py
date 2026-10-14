@@ -25,26 +25,24 @@ DOWNLOAD_TIMEOUT_S = int(os.environ.get("DOWNLOAD_TIMEOUT_S", "120"))
 DIARIZATION_CACHE = "/runpod-volume/hf" if os.path.isdir("/runpod-volume") else None
 SAMPLE_RATE = 16000
 
-# community-1 defaults (threshold 0.60, Fb 0.80) merge distinct voices that arrive
-# through the proxy as one 16 kHz mono WAV. These stay inside the published VBx
-# search range, but toward the sensitive end: lower distance / lower Fb = more speakers.
-DIAR_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.50"))
-DIAR_FA = float(os.environ.get("DIARIZATION_FA", "0.07"))
-DIAR_FB = float(os.environ.get("DIARIZATION_FB", "0.45"))
+# Maximum speaker separation for proxy audio: fast turns, pauses under a second,
+# and background noise. community-1 ships at threshold 0.60 / Fb 0.80, which merges
+# those voices. Lower distance and Fb keep more speakers; higher Fa trusts the
+# acoustics. Values sit at the edge of the VBx search range on purpose.
+DIAR_THRESHOLD = float(os.environ.get("DIARIZATION_THRESHOLD", "0.35"))
+DIAR_FA = float(os.environ.get("DIARIZATION_FA", "0.50"))
+DIAR_FB = float(os.environ.get("DIARIZATION_FB", "0.02"))
 DIAR_MIN_DURATION_OFF = float(os.environ.get("DIARIZATION_MIN_DURATION_OFF", "0.0"))
-# The stock filter drops a voice unless it speaks alone for 20% of a 10s chunk.
-# Short dialogue then has fewer than two embeddings, and VBx labels everyone
-# SPEAKER_00 — even when min_speakers was requested.
-DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.05"))
-# Euclidean distance on unit embeddings. 0.64 ≈ cosine 0.80.
-DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.64"))
-# Automatic rescue refuses to split voices that are still this similar.
-DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.84"))
-DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "2.5"))
-DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "96"))
-# Just above one 2.5s probe window, so a single odd window cannot invent a speaker
-# while a voice that occupies two windows still can.
-DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "2.7"))
+# Stock pyannote drops a voice unless it owns 20% of a 10s chunk alone, so a short
+# reply never gets an embedding and the whole file becomes SPEAKER_00.
+DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.02"))
+# Euclidean distance on unit embeddings. 0.38 ≈ cosine 0.93, so only near-identical
+# windows stay in one cluster.
+DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.38"))
+DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.96"))
+DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
+DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
+DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
 DIAR_MAX_AUTO_SPEAKERS = int(os.environ.get("DIARIZATION_MAX_AUTO_SPEAKERS", "8"))
 
 print(f"[init] device={DEVICE} compute_type={COMPUTE_TYPE} model={WHISPER_MODEL_PATH}", flush=True)
@@ -228,13 +226,59 @@ def _fold_short_clusters(spans, labels, matrix, min_seconds, protect=1):
     return labels
 
 
+def _highpass(audio):
+    """Drop rumble below ~80 Hz. It smears speaker embeddings and is not speech."""
+    from scipy.signal import butter, sosfiltfilt
+
+    if audio.size < SAMPLE_RATE // 4:
+        return audio
+    sos = butter(2, 80.0, btype="highpass", fs=SAMPLE_RATE, output="sos")
+    return sosfiltfilt(sos, audio).astype(np.float32, copy=False)
+
+
+def _suppress_stationary_noise(audio):
+    """Attenuate steady noise (hum, hiss, room tone) on the diarization copy only."""
+    from scipy.signal import istft, stft
+
+    if audio.size < SAMPLE_RATE:
+        return audio
+    frame = 512
+    _, _, spectrum = stft(audio, fs=SAMPLE_RATE, nperseg=frame, noverlap=frame - 128, window="hann")
+    magnitude = np.abs(spectrum)
+    if magnitude.size == 0:
+        return audio
+    noise = np.percentile(magnitude, 20, axis=1, keepdims=True)
+    signal = np.median(magnitude, axis=1, keepdims=True)
+    if float(np.mean(noise)) < 0.2 * float(np.mean(signal) + 1e-8):
+        return audio
+    cleaned = np.maximum(magnitude - noise, 0.08 * magnitude)
+    _, restored = istft(
+        cleaned * np.exp(1j * np.angle(spectrum)),
+        fs=SAMPLE_RATE,
+        nperseg=frame,
+        noverlap=frame - 128,
+        window="hann",
+    )
+    restored = np.asarray(restored, dtype=np.float32)
+    if restored.size >= audio.size:
+        return restored[: audio.size]
+    padded = np.zeros_like(audio)
+    padded[: restored.size] = restored
+    return padded
+
+
 def _prepare_diarization_audio(audio):
-    """Level-match proxy WAVs without touching the samples used for transcription."""
+    """Make proxy WAVs separable: level, rumble, and steady noise. Transcription audio stays raw."""
     prepared = np.array(audio, dtype=np.float32, copy=True)
     if prepared.size == 0:
         return prepared
     prepared -= float(np.mean(prepared))
-    peak = float(np.max(np.abs(prepared)))
+    try:
+        prepared = _highpass(prepared)
+        prepared = _suppress_stationary_noise(prepared)
+    except Exception as exc:
+        print(f"[diarize] audio cleanup skipped: {type(exc).__name__}: {exc}", flush=True)
+    peak = float(np.max(np.abs(prepared))) if prepared.size else 0.0
     if peak < 1e-5:
         return prepared
     if peak < 0.2 or peak > 0.98:
@@ -249,8 +293,12 @@ def _assign_param(owner, name, value):
         setattr(owner, name, value)
         return True
     except Exception as exc:
-        print(f"[diarize] could not set {name}: {exc}", flush=True)
-        return False
+        try:
+            owner.__dict__[name] = value
+            return True
+        except Exception:
+            print(f"[diarize] could not set {name}: {exc}", flush=True)
+            return False
 
 
 def _install_active_ratio(clustering, ratio):
@@ -288,7 +336,8 @@ def _configure_pipeline(model):
     _assign_param(clustering, "threshold", DIAR_THRESHOLD)
     _assign_param(clustering, "Fa", DIAR_FA)
     _assign_param(clustering, "Fb", DIAR_FB)
-    _assign_param(segmentation, "min_duration_off", DIAR_MIN_DURATION_OFF)
+    _assign_param(segmentation, "min_duration_off", 0.0)
+    _assign_param(segmentation, "min_duration_on", 0.0)
     _install_active_ratio(clustering, DIAR_MIN_ACTIVE_RATIO)
     print(
         "[diarize] sensitivity "
@@ -715,6 +764,9 @@ def handler(job):
             timings["diarize_s"] = round(time.time() - t, 2)
             timings["diarize_rescue"] = rescue
             timings["diarize_speakers"] = len(speakers)
+            timings["diarize_threshold"] = DIAR_THRESHOLD
+            timings["diarize_fb"] = DIAR_FB
+            timings["diarize_active_ratio"] = DIAR_MIN_ACTIVE_RATIO
 
         segments = result.get("segments", [])
         return _clean(
