@@ -1,5 +1,7 @@
 import base64
 import gc
+import hashlib
+import importlib.metadata
 import math
 import os
 import tempfile
@@ -307,6 +309,7 @@ def _prepare_diarization_audio(audio):
         prepared = _highpass(prepared)
         prepared = _suppress_stationary_noise(prepared)
     except Exception as exc:
+        _diag_extra["audio_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         print(f"[diarize] audio cleanup skipped: {type(exc).__name__}: {exc}", flush=True)
     peak = float(np.max(np.abs(prepared))) if prepared.size else 0.0
     if peak < 1e-5:
@@ -383,6 +386,9 @@ def _configure_pipeline(model):
 
 
 _diag_runs = []
+# Extra per-job diagnostics. Write-only from the algorithm's point of view: nothing in the
+# separation code reads it back. Cleared by _separate_speakers, returned as output["diarization_debug"].
+_diag_extra = {}
 
 
 def _diag_current():
@@ -438,6 +444,7 @@ def _diagnostic_hook(step_name, step_artifact, file=None, total=None, completed=
             overlap_s = round(float(np.sum(data >= 2)) * step, 2)
             diag["speech_s"] = speech_s
             diag["overlap_s"] = overlap_s
+            diag["speaker_count_step_s"] = round(step, 5)
             diag["max_simultaneous"] = int(np.nanmax(data)) if data.size else 0
             print(
                 f"[diarize] speaker counting: speech={speech_s}s overlap={overlap_s}s "
@@ -548,6 +555,7 @@ def _speech_spans(audio, annotation, window_s):
         while cursor + win <= end:
             spans.append((cursor, cursor + win))
             cursor += win
+    _diag_note("probe", windows_before_cap=len(spans), window_cap=DIAR_MAX_WINDOWS, window_s=window_s)
     if len(spans) > DIAR_MAX_WINDOWS:
         chosen = np.linspace(0, len(spans) - 1, DIAR_MAX_WINDOWS).astype(int)
         spans = [spans[int(index)] for index in chosen]
@@ -678,18 +686,25 @@ def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_sp
 def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers):
     model = pipeline.model
     _diag_runs.clear()
+    _diag_extra.clear()
+    _diag_note("bounds", requested={"num_speakers": num_speakers, "min_speakers": min_speakers, "max_speakers": max_speakers})
     num_speakers, min_speakers, max_speakers = _speaker_bounds(num_speakers, min_speakers, max_speakers)
+    _diag_note("bounds", effective={"num_speakers": num_speakers, "min_speakers": min_speakers, "max_speakers": max_speakers})
     prepared = _prepare_diarization_audio(audio)
+    _diag_record_audio(audio, prepared)
     _configure_pipeline(model)
+    _diag_record_settings(model)
     output = _call_pipeline(model, prepared, num_speakers, min_speakers, max_speakers)
     annotation = _best_annotation(output)
     found = _label_count(annotation)
+    _diag_record_s0(output, annotation)
     rescue = "none"
     similarity = None
     requested = num_speakers or 0
     minimum = min_speakers or 0
     collapsed = found == 1 and requested != 1 and max_speakers != 1
     short = found >= 1 and ((requested and found < requested) or (minimum and found < minimum))
+    _diag_note("trigger", collapsed=bool(collapsed), short=bool(short), probe_ran=bool(collapsed or short), s0_labels=found)
     if collapsed or short:
         try:
             target, similarity, spans, labels = _probe_speakers(
@@ -700,6 +715,8 @@ def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers
         except Exception as exc:
             print(f"[diarize] speaker probe skipped: {type(exc).__name__}: {exc}", flush=True)
             target, spans, labels = None, None, None
+            _diag_note("probe", status="failed", reason=f"{type(exc).__name__}: {exc}")
+        _diag_record_probe(target, similarity, spans, labels)
         if target and target > found:
             if DEVICE == "cuda":
                 torch.cuda.empty_cache()
@@ -712,6 +729,7 @@ def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers
                 raise
             except Exception as exc:
                 print(f"[diarize] recount skipped: {type(exc).__name__}: {exc}", flush=True)
+            _diag_note("probe", retry_target=int(target), retry_labels=_label_count(retried))
             if _label_count(retried) >= 2:
                 annotation = retried
                 rescue = "num_speakers"
@@ -719,6 +737,7 @@ def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers
                 annotation = _annotation_from_spans(spans, labels)
                 rescue = "windows"
     final = _label_count(annotation)
+    _diag_note("final", rescue=rescue, s0_labels=found, final_labels=final)
     print(
         f"[diarize] speakers {found} -> {final} rescue={rescue} "
         f"similarity={None if similarity is None else round(similarity, 3)}",
@@ -738,6 +757,360 @@ def _rows_from_annotation(annotation):
             continue
         rows.append({"start": round(start, 3), "end": round(end, 3), "speaker": str(speaker)})
     return rows
+
+
+# ---------------------------------------------------------------------------------------
+# Diagnostics only (diarization_raw / diarization_debug).
+# Everything below observes; it never mutates the annotation, the audio, the pipeline, the
+# transcription result or any algorithm constant. Every entry point swallows its own errors,
+# so a diagnostics bug can never fail or change a transcription.
+# ---------------------------------------------------------------------------------------
+DIAG_PATCH_VERSION = 1
+DIAG_BASE_COMMIT = "c99803c"
+ROWS_CAP = 5000
+
+
+def _diag_note(section, **values):
+    try:
+        _diag_extra.setdefault(section, {}).update(values)
+    except Exception:
+        pass
+
+
+def _as_number(value):
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    return None if (math.isnan(number) or math.isinf(number)) else number
+
+
+def _effective_settings(model):
+    """Read back what the pipeline object actually holds after _configure_pipeline."""
+    clustering = getattr(model, "clustering", None)
+    segmentation = getattr(model, "segmentation", None)
+    filter_fn = getattr(clustering, "filter_embeddings", None)
+    return {
+        "clustering_class": type(clustering).__name__ if clustering is not None else None,
+        "ahc_threshold": _as_number(getattr(clustering, "threshold", None)),
+        "Fa": _as_number(getattr(clustering, "Fa", None)),
+        "Fb": _as_number(getattr(clustering, "Fb", None)),
+        "min_duration_on": _as_number(getattr(segmentation, "min_duration_on", None)),
+        "min_duration_off": _as_number(getattr(segmentation, "min_duration_off", None)),
+        "min_active_ratio_wrapper_installed": bool(getattr(filter_fn, "_audvid_wrapped", False)),
+        "min_active_ratio": _as_number(getattr(filter_fn, "_audvid_ratio", None)),
+        "probe": {
+            "split_distance_euclidean": DIAR_SPLIT_DISTANCE,
+            "max_split_similarity": DIAR_MAX_SPLIT_SIMILARITY,
+            "window_s": DIAR_WINDOW_S,
+            "max_windows": DIAR_MAX_WINDOWS,
+            "min_speaker_s": DIAR_MIN_SPEAKER_S,
+            "max_auto_speakers": DIAR_MAX_AUTO_SPEAKERS,
+        },
+    }
+
+
+def _library_versions():
+    names = (
+        "torch", "torchaudio", "whisperx", "pyannote.audio", "faster-whisper",
+        "ctranslate2", "numpy", "scikit-learn", "runpod",
+    )
+    versions = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except Exception:
+            versions[name] = None
+    return versions
+
+
+def _diag_record_audio(raw, prepared):
+    try:
+        def level(values):
+            # Block-wise so a long recording never allocates a full float64 copy.
+            values = np.asarray(values).reshape(-1)
+            if values.size == 0:
+                return {"samples": 0}
+            total = 0.0
+            peak = 0.0
+            for offset in range(0, values.size, 1 << 20):
+                block = values[offset:offset + (1 << 20)].astype(np.float64)
+                total += float(np.dot(block, block))
+                peak = max(peak, float(np.max(np.abs(block))))
+            return {
+                "samples": int(values.size),
+                "peak": round(peak, 5),
+                "rms": round(math.sqrt(total / values.size), 5),
+            }
+
+        _diag_extra["audio_prep"] = {
+            "input": level(raw),
+            "prepared": level(prepared),
+            "cleanup_error": _diag_extra.get("audio_cleanup_error"),
+        }
+    except Exception:
+        pass
+
+
+def _diag_record_settings(model):
+    try:
+        _diag_extra["effective_settings"] = _effective_settings(model)
+    except Exception as exc:
+        _diag_extra["effective_settings"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _diag_record_s0(output, annotation):
+    """S0 = the annotation _best_annotation picked from the FIRST Pyannote call, as plain rows."""
+    try:
+        inclusive = getattr(output, "speaker_diarization", None)
+        exclusive = getattr(output, "exclusive_speaker_diarization", None)
+        if annotation is not None and annotation is exclusive:
+            selected, other_kind, other = "exclusive", "inclusive", inclusive
+        elif annotation is not None and annotation is inclusive:
+            selected, other_kind, other = "inclusive", "exclusive", exclusive
+        else:
+            selected, other_kind, other = "annotation", None, None
+        _diag_extra["s0"] = {
+            "selected": selected,
+            "labels": _label_count(annotation),
+            "inclusive_labels": _label_count(inclusive),
+            "exclusive_labels": _label_count(exclusive),
+            "rows": _rows_from_annotation(annotation),
+            "alternative_kind": other_kind,
+            "alternative_rows": _rows_from_annotation(other) if other is not None else None,
+        }
+    except Exception as exc:
+        _diag_extra["s0_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _diag_record_probe(target, similarity, spans, labels):
+    try:
+        _diag_note(
+            "probe",
+            target=int(target) if target else None,
+            centroid_similarity=_as_number(similarity),
+            windows_embedded=len(spans) if spans is not None else None,
+            clusters=len(set(int(value) for value in labels)) if labels is not None else None,
+        )
+    except Exception:
+        pass
+
+
+def _count_words(segments):
+    total = tagged = 0
+    for segment in segments:
+        for word in segment.get("words") or []:
+            total += 1
+            if word.get("speaker"):
+                tagged += 1
+    return total, tagged
+
+
+def _binding_stats(segments, rows):
+    """Measured on the final word tags against the S1 rows. Read-only."""
+    if not rows:
+        return {}
+    starts = np.array([row["start"] for row in rows], dtype=np.float64)
+    ends = np.array([row["end"] for row in rows], dtype=np.float64)
+    names = [row["speaker"] for row in rows]
+    per_speaker = {}
+    untagged = no_timestamp = overlapping = no_overlap = differs_from_max_overlap = 0
+    for segment in segments:
+        for word in segment.get("words") or []:
+            speaker = word.get("speaker")
+            if not speaker:
+                untagged += 1
+                continue
+            per_speaker[str(speaker)] = per_speaker.get(str(speaker), 0) + 1
+            if word.get("start") is None:
+                no_timestamp += 1
+                continue
+            start = float(word["start"])
+            end = float(word["end"]) if word.get("end") is not None else start
+            overlap = np.minimum(end, ends) - np.maximum(start, starts)
+            best = int(np.argmax(overlap))
+            if float(overlap[best]) > 0.0:
+                overlapping += 1
+                if names[best] != speaker:
+                    differs_from_max_overlap += 1
+            else:
+                no_overlap += 1
+    return {
+        "words_per_speaker": per_speaker,
+        "untagged_final": untagged,
+        "tagged_without_timestamp": no_timestamp,
+        "tagged_overlapping_a_row": overlapping,
+        "tagged_without_any_overlap_nearest_assigned": no_overlap,
+        "tag_differs_from_max_overlap_row": differs_from_max_overlap,
+    }
+
+
+def _capped_rows(rows):
+    rows = rows or []
+    return {"total": len(rows), "truncated": len(rows) > ROWS_CAP, "rows": rows[:ROWS_CAP]}
+
+
+def _diag_replacement(rescue, s0_labels, s1_labels):
+    trigger = _diag_extra.get("trigger") or {}
+    probe = _diag_extra.get("probe") or {}
+    if rescue == "none":
+        replaced = False
+        if not trigger.get("probe_ran"):
+            code = "pipeline_rows_kept_probe_not_triggered"
+            reason = "Pyannote returned at least the requested/minimum speakers; _probe_speakers was not run."
+        elif probe.get("status") == "failed":
+            code = "pipeline_rows_kept_probe_failed"
+            reason = f"_probe_speakers failed: {probe.get('reason')}"
+        else:
+            code = "pipeline_rows_kept_probe_found_no_larger_split"
+            reason = "_probe_speakers ran but did not find more speakers than Pyannote; Pyannote rows kept."
+    elif rescue == "num_speakers":
+        replaced = True
+        code = "pipeline_recount_with_forced_speakers"
+        reason = f"Pyannote was called a second time forcing {probe.get('retry_target')} speakers; S1 is that second call's annotation."
+    elif rescue == "windows":
+        replaced = True
+        code = "window_labels_from_embedding_clustering"
+        reason = "The recount returned <2 speakers; S1 is built from embedding windows (_annotation_from_spans). Gaps between windows are not filled."
+    else:
+        replaced = None
+        code = "unknown_rescue_value"
+        reason = f"unrecognised rescue value: {rescue}"
+    return {
+        "replaced_pyannote_rows": replaced,
+        "reason_code": code,
+        "reason": reason,
+        "s0_labels": s0_labels,
+        "s1_labels": s1_labels,
+        "s1_labels_differ_from_s0": (s0_labels != s1_labels) if s0_labels is not None else None,
+    }
+
+
+def _diag_warnings(rescue, speakers):
+    extra = _diag_extra
+    probe = extra.get("probe") or {}
+    hook = _diag_runs[0] if _diag_runs else {}
+    found = []
+    if extra.get("audio_cleanup_error"):
+        found.append(f"audio cleanup for diarization was skipped: {extra.get('audio_cleanup_error')}")
+    if hook.get("clustering_input") is not None and hook.get("clustering_input") < 2:
+        found.append("fewer than 2 embeddings reached Pyannote's clustering; Pyannote can only return one speaker")
+    if hook.get("embeddings_nan"):
+        found.append(f"{hook.get('embeddings_nan')} Pyannote embedding rows were NaN")
+    if probe.get("status") == "failed":
+        found.append(f"_probe_speakers failed: {probe.get('reason')}")
+    before = probe.get("windows_before_cap")
+    embedded = probe.get("windows_embedded")
+    cap = probe.get("window_cap")
+    if before is not None and cap is not None and before > cap:
+        found.append(
+            f"probe windows were sub-sampled {before} -> {cap}; "
+            "S1 rows (only when rescue == 'windows') cover just the sampled windows and leave gaps"
+        )
+    if before is not None and embedded is not None and embedded < min(before, cap or before):
+        found.append(f"{min(before, cap or before) - embedded} probe windows were dropped before clustering (too short, quiet or non-finite)")
+    s0 = extra.get("s0") or {}
+    if rescue != "none" and s0.get("labels") is not None and s0.get("labels") != len(speakers):
+        found.append(f"S1 differs from Pyannote: {s0.get('labels')} -> {len(speakers)} speakers (rescue={rescue})")
+    if s0.get("selected") == "exclusive":
+        found.append("S0 uses Pyannote's exclusive annotation (overlap removed); the inclusive one is in s0.alternative")
+    return found
+
+
+def _build_diarization_debug(rescue, speakers, segments, rows, job_id=None, duration_s=None):
+    extra = _diag_extra
+    fingerprint = hashlib.sha256(str(job_id).encode("utf-8")).hexdigest()[:12] if job_id not in (None, "") else None
+    s0 = extra.get("s0") or {}
+    words_total, words_tagged = _count_words(segments)
+    binding = {
+        "status": "ok" if words_total else "no_word_level_entries",
+        "words_total": words_total,
+        "tagged_final": words_tagged,
+    }
+    try:
+        binding.update(_binding_stats(segments, rows))
+    except Exception as exc:
+        binding["stats_error"] = f"{type(exc).__name__}: {exc}"
+    probe = dict(extra.get("probe") or {})
+    return {
+        "schema_version": 1,
+        "status": "ok",
+        "worker_code": {"base_commit": DIAG_BASE_COMMIT, "diag_patch": DIAG_PATCH_VERSION},
+        "computed_in_this_job": True,
+        "job_fingerprint_sha256_12": fingerprint,
+        "audio_duration_s": duration_s,
+        "replacement": _diag_replacement(rescue, s0.get("labels"), len(speakers)),
+        "warnings": _diag_warnings(rescue, speakers),
+        "models": {
+            "diarization": DIARIZATION_MODEL,
+            "asr": WHISPER_MODEL,
+            "device": DEVICE,
+            "compute_type": COMPUTE_TYPE,
+        },
+        "libraries": _library_versions(),
+        "requested_bounds": extra.get("bounds"),
+        "effective_settings": extra.get("effective_settings"),
+        "configured_constants": {
+            "threshold": DIAR_THRESHOLD,
+            "Fa": DIAR_FA,
+            "Fb": DIAR_FB,
+            "min_active_ratio": DIAR_MIN_ACTIVE_RATIO,
+            "min_duration_off": DIAR_MIN_DURATION_OFF,
+            "split_distance_euclidean": DIAR_SPLIT_DISTANCE,
+            "max_split_similarity": DIAR_MAX_SPLIT_SIMILARITY,
+        },
+        "audio_prep": extra.get("audio_prep"),
+        "trigger": extra.get("trigger"),
+        "s0": {
+            "selected": s0.get("selected"),
+            "labels": s0.get("labels"),
+            "inclusive_labels": s0.get("inclusive_labels"),
+            "exclusive_labels": s0.get("exclusive_labels"),
+            "rows_key": "diarization_raw",
+            "alternative": {
+                "kind": s0.get("alternative_kind"),
+                "available": s0.get("alternative_rows") is not None,
+                **_capped_rows(s0.get("alternative_rows")),
+            },
+        },
+        "s1": {
+            "rescue": rescue,
+            "speakers": len(speakers),
+            "speaker_labels": list(speakers),
+            "rows_key": "diarization",
+            "probe": probe,
+            "word_binding": binding,
+        },
+        "notes": {
+            "diarization_raw": "S0: rows of the annotation _best_annotation selected from the first Pyannote call (rows shorter than 0.05 s dropped, as for S1).",
+            "diarization": "S1: final rows. Equal to S0 when s1.rescue == 'none'.",
+            "exclusive_diarization": "Legacy key; an exact copy of 'diarization', not Pyannote's exclusive annotation.",
+            "timings.diarize_debug[].overlap_s": (
+                "Pyannote's own estimate: seconds where the pre-clustering speaker-count track is >= 2 "
+                "(sum(count >= 2) * speaker_count_step_s). Not derived from the output rows."
+            ),
+            "timings.diarize_debug": "One entry per Pyannote call; a second entry exists only when rescue == 'num_speakers'.",
+        },
+    }
+
+
+def _diag_output_fields(rescue, speakers, segments, rows, job_id, duration_s):
+    fields = {}
+    try:
+        s0 = _diag_extra.get("s0")
+        if s0 is not None:
+            fields["diarization_raw"] = list(s0.get("rows") or [])
+        fields["diarization_debug"] = _build_diarization_debug(
+            rescue, speakers, segments, rows, job_id=job_id, duration_s=duration_s
+        )
+    except Exception as exc:  # diagnostics must never break a transcription
+        print(f"[diarize] debug payload failed: {type(exc).__name__}: {exc}", flush=True)
+        fields["diarization_debug"] = {
+            "schema_version": 1,
+            "status": "failed",
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+    return fields
 
 
 def _fill_word_speakers(segments, rows):
@@ -887,6 +1260,15 @@ def handler(job):
 
         speakers = []
         diarization_rows = []
+        diag_fields = {}
+        if diarization and not result["segments"]:
+            diag_fields = {
+                "diarization_debug": {
+                    "schema_version": 1,
+                    "status": "skipped",
+                    "reason": "transcription returned no segments",
+                }
+            }
         if diarization and result["segments"]:
             t = time.time()
             annotation, rescue = _separate_speakers(
@@ -898,6 +1280,9 @@ def handler(job):
             )
             result, diarization_rows = _assign_speakers(result, annotation)
             speakers = _collect_speakers(result.get("segments") or [], diarization_rows)
+            diag_fields = _diag_output_fields(
+                rescue, speakers, result.get("segments") or [], diarization_rows, job.get("id"), duration_s
+            )
             timings["diarize_s"] = round(time.time() - t, 2)
             timings["diarize_rescue"] = rescue
             timings["diarize_speakers"] = len(speakers)
@@ -919,6 +1304,7 @@ def handler(job):
                 "duration_s": duration_s,
                 "timings": timings,
                 "model": WHISPER_MODEL,
+                **diag_fields,
             }
         )
     except Exception as exc:

@@ -1,0 +1,137 @@
+name: diag worker image (isolated)
+
+# Builds ONE uniquely tagged diagnostic image from a `diag/**` branch.
+#   * runs only for branches named diag/**  (never main / master / tags)
+#   * pushes exactly one tag:  diag-<UTCdate>-<sha7>   (never :latest, never a v* tag)
+#   * refuses to overwrite an existing tag
+#   * fails if the digest of :latest changed while it ran
+#   * never talks to RunPod, never changes any endpoint or template
+on:
+  push:
+    branches: ["diag/**"]
+    paths:
+      - "runpod-worker/**"
+      - ".github/workflows/diag-worker-image.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: diag-worker-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # c99803c = the handler.py that is baked into the image RunPod uses today.
+  BASE_COMMIT: c99803cc18577374632a8c851f8c92e085c87f37
+  BASE_SHA256: b724032177a574e23631f6cd564e44af4d046d705ca9a7559dc1271dce6e06c0
+  IMAGE_NAME: audvid-whisperx
+
+jobs:
+  check:
+    if: startsWith(github.ref, 'refs/heads/diag/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install test dependencies
+        run: pip install numpy==1.26.4 scipy==1.13.1 scikit-learn==1.5.2
+
+      - name: Syntax (py_compile)
+        run: python -m py_compile runpod-worker/handler.py
+
+      - name: Recover the base handler.py (c99803c) and verify it is the deployed one
+        run: |
+          git show "$BASE_COMMIT:runpod-worker/handler.py" > /tmp/handler_base.py
+          echo "$BASE_SHA256  /tmp/handler_base.py" | sha256sum -c -
+
+      - name: Algorithm unchanged (AST proof)
+        run: python runpod-worker/diag/verify_unchanged.py /tmp/handler_base.py runpod-worker/handler.py
+
+      - name: Diagnostics helpers
+        run: python runpod-worker/diag/test_diag_patch.py runpod-worker/handler.py
+
+      - name: Differential run base vs patched (stubbed models)
+        run: python runpod-worker/diag/diff_run_handler.py /tmp/handler_base.py runpod-worker/handler.py
+
+  build:
+    needs: check
+    if: startsWith(github.ref, 'refs/heads/diag/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free runner disk (image is ~12 GB)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tag and snapshot :latest
+        id: meta
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          tag="diag-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          repo="$DH_USER/$IMAGE_NAME"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"
+          case "$tag" in diag-*) ;; *) echo "unexpected tag $tag"; exit 1 ;; esac
+          if docker buildx imagetools inspect "$repo:$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists - refusing to overwrite"; exit 1
+          fi
+          latest_before="$(docker buildx imagetools inspect "$repo:latest" --format '{{json .Manifest.Digest}}' 2>/dev/null || echo none)"
+          echo "latest_before=$latest_before" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: runpod-worker
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.tag }}
+
+      - name: Verify the pushed image contains exactly this handler.py and :latest is untouched
+        env:
+          REPO: ${{ steps.meta.outputs.repo }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          LATEST_BEFORE: ${{ steps.meta.outputs.latest_before }}
+        run: |
+          expected="$(sha256sum runpod-worker/handler.py | cut -d' ' -f1)"
+          actual="$(docker run --rm --entrypoint sha256sum "$REPO:$TAG" /opt/worker/handler.py | cut -d' ' -f1)"
+          echo "repo handler.py sha256 : $expected"
+          echo "image handler.py sha256: $actual"
+          test "$expected" = "$actual"
+          docker run --rm --entrypoint grep "$REPO:$TAG" -c diarization_raw /opt/worker/handler.py
+          digest="$(docker buildx imagetools inspect "$REPO:$TAG" --format '{{json .Manifest.Digest}}')"
+          latest_after="$(docker buildx imagetools inspect "$REPO:latest" --format '{{json .Manifest.Digest}}' 2>/dev/null || echo none)"
+          test "$LATEST_BEFORE" = "$latest_after"
+          {
+            echo "### Diagnostic image pushed (not deployed)"
+            echo "- image: \`$REPO:$TAG\`"
+            echo "- digest: \`$digest\`"
+            echo "- handler.py sha256: \`$actual\`"
+            echo "- :latest digest unchanged: \`$latest_after\`"
+            echo "- commit: \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
