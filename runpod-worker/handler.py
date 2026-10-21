@@ -42,6 +42,11 @@ DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.
 # windows stay in one cluster.
 DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.38"))
 DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.96"))
+# Re-check each Pyannote label on its own windows. 0.70 Euclidean on unit vectors is
+# cosine similarity ≈ 0.76: only clearly different voices split. A shout or a pitch
+# change stays one person. This does not change Pyannote's own VBx threshold.
+DIAR_WITHIN_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WITHIN_SPLIT_DISTANCE", "0.70"))
+DIAR_WITHIN_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WITHIN_MAX_SIMILARITY", "0.75"))
 DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
 DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
 DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
@@ -517,11 +522,11 @@ def _best_annotation(output):
         return output
     inclusive = getattr(output, "speaker_diarization", None)
     exclusive = getattr(output, "exclusive_speaker_diarization", None)
-    if exclusive is None or len(exclusive) == 0:
+    # Inclusive keeps a second voice during overlap. Exclusive deletes one of them,
+    # so two simultaneous people become one label. Prefer inclusive whenever it exists.
+    if inclusive is not None and len(inclusive) > 0:
         return inclusive
-    if inclusive is None or _label_count(exclusive) >= _label_count(inclusive):
-        return exclusive
-    return inclusive
+    return exclusive
 
 
 def _probe_window_s(audio):
@@ -683,6 +688,142 @@ def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_sp
     return target, similarity, kept, labels
 
 
+def _speaker_windows(audio, annotation, speaker, window_s):
+    """Non-overlapping windows inside one Pyannote speaker. Same geometry as _speech_spans."""
+    win = int(window_s * SAMPLE_RATE)
+    minimum = int(SAMPLE_RATE)
+    spans = []
+    for segment, _, label in annotation.itertracks(yield_label=True):
+        if str(label) != str(speaker):
+            continue
+        start = int(max(0.0, float(segment.start)) * SAMPLE_RATE)
+        end = int(min(len(audio) / SAMPLE_RATE, float(segment.end)) * SAMPLE_RATE)
+        start = max(0, min(start, len(audio)))
+        end = max(start, min(end, len(audio)))
+        if end - start < minimum:
+            continue
+        if end - start < win:
+            spans.append((start, end))
+            continue
+        cursor = start
+        while cursor + win <= end:
+            spans.append((cursor, cursor + win))
+            cursor += win
+        tail = end - cursor
+        if tail >= minimum:
+            spans.append((cursor, end))
+    return spans
+
+
+def _annotation_from_named(tracks):
+    from pyannote.core import Annotation, Segment
+
+    annotation = Annotation()
+    for index, (start, end, name) in enumerate(tracks):
+        start, end = float(start), float(end)
+        if end - start < 0.05 or not name:
+            continue
+        annotation[Segment(start, end), index] = str(name)
+    return annotation
+
+
+def _split_within_speakers(model, audio, annotation):
+    """Split one Pyannote label when its own windows are not the same voice.
+
+    Different Pyannote labels are never merged. A split is kept only when the
+    centroid cosine is at or below DIAR_MAX_SPLIT_SIMILARITY (near-copies stay one
+    person: shout, pitch, volume). Returns (annotation or None, split_count, notes).
+    """
+    embedding_model = getattr(model, "_embedding", None)
+    if embedding_model is None or annotation is None or len(annotation) == 0:
+        return None, 0, [{
+            "reason": "no_embedding_model" if embedding_model is None else "no_annotation",
+        }]
+    window_s = _probe_window_s(audio)
+    durations = {}
+    for segment, _, label in annotation.itertracks(yield_label=True):
+        name = str(label)
+        durations[name] = durations.get(name, 0.0) + max(0.0, float(segment.end) - float(segment.start))
+    order = sorted(durations, key=lambda name: durations[name], reverse=True)
+    used = set(order)
+    tracks = []
+    notes = []
+    splits = 0
+    ceiling = max(DIAR_MAX_AUTO_SPEAKERS, len(order)) + 4
+    for speaker in order:
+        original = []
+        for segment, _, label in annotation.itertracks(yield_label=True):
+            if str(label) == speaker:
+                original.append((float(segment.start), float(segment.end), speaker))
+        if len(used) >= ceiling:
+            tracks.extend(original)
+            continue
+        spans = _speaker_windows(audio, annotation, speaker, window_s)
+        kept, matrix = _embed_spans(embedding_model, audio, spans, window_s) if len(spans) >= 2 else ([], None)
+        if matrix is None or len(kept) < 2:
+            tracks.extend(original)
+            notes.append({"speaker": speaker, "windows": len(kept), "split": False, "reason": "too_few_windows"})
+            continue
+        finite = np.all(np.isfinite(matrix), axis=1)
+        if not np.all(finite):
+            kept = [span for span, ok in zip(kept, finite) if ok]
+            matrix = matrix[finite]
+        if len(kept) < 2:
+            tracks.extend(original)
+            notes.append({"speaker": speaker, "windows": len(kept), "split": False, "reason": "non_finite"})
+            continue
+        room = max(2, min(3, ceiling - len(used) + 1))
+        labels, _similarity = _cluster_embeddings(
+            matrix, DIAR_WITHIN_SPLIT_DISTANCE, min_clusters=1, max_clusters=room
+        )
+        normalized = _normalize_rows(matrix)
+        labels = _fold_short_clusters(kept, labels, normalized, DIAR_MIN_SPEAKER_S, protect=1)
+        labels = _compact_labels(labels)
+        similarity = _min_centroid_cosine(normalized, labels)
+        found = len(set(int(value) for value in labels))
+        if found < 2 or similarity > DIAR_WITHIN_MAX_SIMILARITY:
+            tracks.extend(original)
+            notes.append({
+                "speaker": speaker,
+                "windows": len(kept),
+                "split": False,
+                "clusters": found,
+                "centroid_cosine": round(float(similarity), 4),
+                "reason": "same_voice",
+            })
+            continue
+        sizes = {int(value): 0.0 for value in labels}
+        for label, (start, end) in zip(labels, kept):
+            sizes[int(label)] = sizes[int(label)] + (float(end) - float(start))
+        primary = max(sizes, key=sizes.get)
+        rename = {primary: speaker}
+        for label in sorted(sizes):
+            if label == primary:
+                continue
+            number = 0
+            while True:
+                candidate = f"SPEAKER_{number:02d}"
+                number += 1
+                if candidate not in used and candidate not in rename.values():
+                    rename[label] = candidate
+                    used.add(candidate)
+                    break
+        for (start, end), label in zip(kept, labels):
+            tracks.append((float(start), float(end), rename[int(label)]))
+        splits += found - 1
+        notes.append({
+            "speaker": speaker,
+            "windows": len(kept),
+            "split": True,
+            "clusters": found,
+            "centroid_cosine": round(float(similarity), 4),
+            "new_labels": sorted(set(rename.values())),
+        })
+    if splits <= 0:
+        return None, 0, notes
+    return _annotation_from_named(tracks), splits, notes
+
+
 def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers):
     model = pipeline.model
     _diag_runs.clear()
@@ -704,8 +845,33 @@ def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers
     minimum = min_speakers or 0
     collapsed = found == 1 and requested != 1 and max_speakers != 1
     short = found >= 1 and ((requested and found < requested) or (minimum and found < minimum))
-    _diag_note("trigger", collapsed=bool(collapsed), short=bool(short), probe_ran=bool(collapsed or short), s0_labels=found)
-    if collapsed or short:
+    within_ann, within_splits, within_notes = None, 0, []
+    try:
+        within_ann, within_splits, within_notes = _split_within_speakers(model, prepared, annotation)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as exc:
+        print(f"[diarize] within-speaker split skipped: {type(exc).__name__}: {exc}", flush=True)
+        _diag_note("within_split", status="failed", reason=f"{type(exc).__name__}: {exc}")
+    else:
+        _diag_note(
+            "within_split",
+            status="ran",
+            splits=int(within_splits),
+            speakers=within_notes,
+        )
+    if within_ann is not None and within_splits > 0 and _label_count(within_ann) > found:
+        annotation = within_ann
+        rescue = "split_within"
+    _diag_note(
+        "trigger",
+        collapsed=bool(collapsed),
+        short=bool(short),
+        probe_ran=True,
+        within_split=rescue == "split_within",
+        s0_labels=found,
+    )
+    if rescue != "split_within" and (collapsed or short):
         try:
             target, similarity, spans, labels = _probe_speakers(
                 model, prepared, annotation, num_speakers, min_speakers, max_speakers
@@ -765,7 +931,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 1
+DIAG_PATCH_VERSION = 2
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
 
@@ -802,6 +968,8 @@ def _effective_settings(model):
         "probe": {
             "split_distance_euclidean": DIAR_SPLIT_DISTANCE,
             "max_split_similarity": DIAR_MAX_SPLIT_SIMILARITY,
+            "within_split_distance_euclidean": DIAR_WITHIN_SPLIT_DISTANCE,
+            "within_max_similarity": DIAR_WITHIN_MAX_SIMILARITY,
             "window_s": DIAR_WINDOW_S,
             "max_windows": DIAR_MAX_WINDOWS,
             "min_speaker_s": DIAR_MIN_SPEAKER_S,
@@ -955,7 +1123,17 @@ def _diag_replacement(rescue, s0_labels, s1_labels):
     probe = _diag_extra.get("probe") or {}
     if rescue == "none":
         replaced = False
-        if not trigger.get("probe_ran"):
+        within = _diag_extra.get("within_split") or {}
+        if within.get("status") == "ran":
+            code = "pyannote_kept_within_speaker_same_voice"
+            reason = (
+                "Every Pyannote speaker was re-embedded on its own windows. "
+                "No label contained two voices far enough to split, so Pyannote rows were kept."
+            )
+        elif within.get("status") == "failed":
+            code = "pipeline_rows_kept_within_split_failed"
+            reason = f"Within-speaker embedding split failed: {within.get('reason')}"
+        elif not trigger.get("probe_ran"):
             code = "pipeline_rows_kept_probe_not_triggered"
             reason = "Pyannote returned at least the requested/minimum speakers; _probe_speakers was not run."
         elif probe.get("status") == "failed":
@@ -964,6 +1142,14 @@ def _diag_replacement(rescue, s0_labels, s1_labels):
         else:
             code = "pipeline_rows_kept_probe_found_no_larger_split"
             reason = "_probe_speakers ran but did not find more speakers than Pyannote; Pyannote rows kept."
+    elif rescue == "split_within":
+        replaced = True
+        code = "within_speaker_embedding_split"
+        within = _diag_extra.get("within_split") or {}
+        reason = (
+            "Each Pyannote speaker was embedded on its own. A label was split only where its windows "
+            f"were not the same voice (centroid cosine <= {DIAR_WITHIN_MAX_SIMILARITY}). splits={within.get('splits')}."
+        )
     elif rescue == "num_speakers":
         replaced = True
         code = "pipeline_recount_with_forced_speakers"
@@ -1058,6 +1244,8 @@ def _build_diarization_debug(rescue, speakers, segments, rows, job_id=None, dura
             "min_duration_off": DIAR_MIN_DURATION_OFF,
             "split_distance_euclidean": DIAR_SPLIT_DISTANCE,
             "max_split_similarity": DIAR_MAX_SPLIT_SIMILARITY,
+            "within_split_distance_euclidean": DIAR_WITHIN_SPLIT_DISTANCE,
+            "within_max_similarity": DIAR_WITHIN_MAX_SIMILARITY,
         },
         "audio_prep": extra.get("audio_prep"),
         "trigger": extra.get("trigger"),

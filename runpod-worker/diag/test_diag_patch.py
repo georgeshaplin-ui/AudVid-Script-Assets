@@ -139,6 +139,7 @@ json.dumps(ns["_clean"](fields))  # must serialise (NaN/inf/numpy handled by _cl
 for rescue, code, replaced in (
     ("num_speakers", "pipeline_recount_with_forced_speakers", True),
     ("windows", "window_labels_from_embedding_clustering", True),
+    ("split_within", "within_speaker_embedding_split", True),
 ):
     info = ns["_diag_replacement"](rescue, 1, 2)
     assert info["reason_code"] == code and info["replaced_pyannote_rows"] is replaced, info
