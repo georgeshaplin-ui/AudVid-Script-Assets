@@ -341,6 +341,71 @@ def main():
     if tags != ["SPEAKER_00", "SPEAKER_00", "SPEAKER_01"]:
         failures.append(f"boundary words moved to the next speaker: {tags}")
 
+    class MeanEmbedding:
+        def __call__(self, tensor):
+            clips = tensor.arr[:, 0, :]
+            out = []
+            for clip in clips:
+                if float(np.mean(np.abs(clip))) > 0.15:
+                    out.append([1.0, 0.0, 0.0])
+                else:
+                    out.append([0.20, 0.98, 0.0])
+            return np.asarray(out, dtype=np.float32)
+
+    def word(start, end, speaker):
+        return {"word": "w", "start": start, "end": end, "speaker": speaker}
+
+    swallowed_audio = np.concatenate([
+        np.full(3 * SR, 0.30, dtype=np.float32),
+        np.full(4 * SR, 0.05, dtype=np.float32),
+    ])
+    swallowed = [{"words": [
+        word(0.3, 0.7, "SPEAKER_00"),
+        word(0.9, 1.3, "SPEAKER_00"),
+        word(1.5, 1.9, "SPEAKER_00"),
+        word(3.4, 3.8, "SPEAKER_00"),
+        word(4.2, 4.6, "SPEAKER_00"),
+        word(5.0, 5.4, "SPEAKER_00"),
+        word(5.8, 6.2, "SPEAKER_00"),
+    ]}]
+    swallowed_info = module._retie_words_by_voice(MeanEmbedding(), swallowed_audio, swallowed)
+    host = swallowed[0]["words"][0]["speaker"]
+    guest = {item["speaker"] for item in swallowed[0]["words"] if item["start"] >= 3.4}
+    if swallowed_info.get("status") != "ran" or host in guest or len(guest) != 1:
+        failures.append(f"swallowed voice was not recovered: {swallowed_info} host={host} guest={guest}")
+
+    boundary_audio = np.concatenate([
+        np.full(2 * SR, 0.30, dtype=np.float32),
+        np.full(4 * SR, 0.05, dtype=np.float32),
+    ])
+    boundary = [{"words": [
+        word(0.4, 0.8, "SPEAKER_00"),
+        word(1.0, 1.4, "SPEAKER_00"),
+        word(2.1, 2.5, "SPEAKER_00"),
+        word(3.0, 3.4, "SPEAKER_01"),
+        word(3.6, 4.0, "SPEAKER_01"),
+        word(4.4, 4.8, "SPEAKER_01"),
+    ]}]
+    boundary_info = module._retie_words_by_voice(MeanEmbedding(), boundary_audio, boundary)
+    if boundary[0]["words"][2]["speaker"] != "SPEAKER_01":
+        failures.append(
+            f"turn-start word stayed with the previous speaker: "
+            f"{boundary[0]['words'][2]['speaker']} {boundary_info}"
+        )
+
+    same_audio = np.full(4 * SR, 0.30, dtype=np.float32)
+    same = [{"words": [
+        word(0.3, 0.7, "SPEAKER_00"),
+        word(0.9, 1.3, "SPEAKER_00"),
+        word(1.6, 2.0, "SPEAKER_00"),
+        word(2.4, 2.8, "SPEAKER_00"),
+        word(3.1, 3.5, "SPEAKER_00"),
+    ]}]
+    same_info = module._retie_words_by_voice(MeanEmbedding(), same_audio, same)
+    same_labels = {item["speaker"] for item in same[0]["words"]}
+    if same_labels != {"SPEAKER_00"} or same_info.get("splits"):
+        failures.append(f"one voice was split by the word pass: {same_labels} {same_info}")
+
     if failures:
         print("WITHIN_SPLIT_FAILED")
         for message in failures:
