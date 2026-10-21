@@ -319,9 +319,12 @@ def main():
         annotation = make_annotation([(0, 6, "SPEAKER_00")])
         return module._split_within_speakers(model, audio, annotation)
 
-    different, different_splits, different_notes = level_split([0.80, 0.60, 0.0])
+    different, different_splits, different_notes = level_split([0.0, 1.0, 0.0])
     if different_splits < 1 or different is None:
-        failures.append(f"cosine 0.80 voices stayed merged: {different_notes}")
+        failures.append(f"clearly different voices stayed merged: {different_notes}")
+    close, close_splits, close_notes = level_split([0.85, 0.526782, 0.0])
+    if close_splits != 0 or close is not None:
+        failures.append(f"cosine 0.85 same-voice variation was split: splits={close_splits} notes={close_notes}")
     same_print, same_splits, same_notes = level_split([0.995, 0.100, 0.0])
     if same_splits != 0 or same_print is not None:
         failures.append(f"near-copy voice was split: splits={same_splits} notes={same_notes}")
@@ -405,6 +408,36 @@ def main():
     same_labels = {item["speaker"] for item in same[0]["words"]}
     if same_labels != {"SPEAKER_00"} or same_info.get("splits"):
         failures.append(f"one voice was split by the word pass: {same_labels} {same_info}")
+
+    class MildEmbedding:
+        def __call__(self, tensor):
+            clips = tensor.arr[:, 0, :]
+            out = []
+            for clip in clips:
+                if float(np.mean(np.abs(clip))) > 0.2:
+                    out.append([1.0, 0.0, 0.0])
+                else:
+                    out.append([0.85, 0.526782, 0.0])
+            return np.asarray(out, dtype=np.float32)
+
+    mild_audio = np.concatenate([
+        np.full(3 * SR, 0.30, dtype=np.float32),
+        np.full(3 * SR, 0.12, dtype=np.float32),
+    ])
+    mild = [{"words": [
+        word(0.3, 0.8, "SPEAKER_00"),
+        word(1.0, 1.5, "SPEAKER_00"),
+        word(1.7, 2.2, "SPEAKER_00"),
+        word(2.4, 2.9, "SPEAKER_00"),
+        word(3.3, 3.8, "SPEAKER_00"),
+        word(4.0, 4.5, "SPEAKER_00"),
+        word(4.7, 5.2, "SPEAKER_00"),
+        word(5.4, 5.9, "SPEAKER_00"),
+    ]}]
+    mild_info = module._retie_words_by_voice(MildEmbedding(), mild_audio, mild)
+    mild_labels = {item["speaker"] for item in mild[0]["words"]}
+    if mild_labels != {"SPEAKER_00"} or mild_info.get("splits"):
+        failures.append(f"unchanged voice print was split: {mild_labels} {mild_info}")
 
     if failures:
         print("WITHIN_SPLIT_FAILED")

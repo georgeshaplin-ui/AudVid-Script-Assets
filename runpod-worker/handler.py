@@ -42,25 +42,26 @@ DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.
 # windows stay in one cluster.
 DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.38"))
 DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.96"))
-# Re-check each Pyannote label on short windows. 0.45 Euclidean on unit vectors is
-# cosine similarity ≈ 0.90, so two voices split unless they are nearly the same print.
-# A fast interruption is shorter than the old 1.25s window, which was mixing both
-# people into one vector. Pyannote's own VBx threshold is unchanged.
-DIAR_WITHIN_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WITHIN_SPLIT_DISTANCE", "0.45"))
-DIAR_WITHIN_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WITHIN_MAX_SIMILARITY", "0.90"))
+# A Pyannote label is split only when its own windows are clearly different voices.
+# 0.75 Euclidean on unit vectors is cosine similarity ≈ 0.72. A shout or a small
+# pitch change stays one person. Pyannote's own VBx threshold is unchanged.
+DIAR_WITHIN_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WITHIN_SPLIT_DISTANCE", "0.75"))
+DIAR_WITHIN_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WITHIN_MAX_SIMILARITY", "0.72"))
 DIAR_WITHIN_WINDOW_S = float(os.environ.get("DIARIZATION_WITHIN_WINDOW_S", "0.50"))
 DIAR_WITHIN_HOP_S = float(os.environ.get("DIARIZATION_WITHIN_HOP_S", "0.25"))
 DIAR_WITHIN_MIN_SPAN_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPAN_S", "0.35"))
 DIAR_WITHIN_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPEAKER_S", "0.30"))
 DIAR_WITHIN_MAX_CLUSTERS = int(os.environ.get("DIARIZATION_WITHIN_MAX_CLUSTERS", "4"))
-# Each word gets its own voice print. 0.40 s is long enough for the embedding and
-# short enough to be one person. A word moves when another voice matches it more
-# clearly, and a run of words that is not the surrounding voice becomes its own speaker.
-DIAR_WORD_WINDOW_S = float(os.environ.get("DIARIZATION_WORD_WINDOW_S", "0.40"))
-DIAR_WORD_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WORD_SPLIT_DISTANCE", "0.40"))
-DIAR_WORD_SPLIT_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WORD_SPLIT_MAX_SIMILARITY", "0.93"))
-DIAR_WORD_MOVE_MARGIN = float(os.environ.get("DIARIZATION_WORD_MOVE_MARGIN", "0.08"))
-DIAR_WORD_MIN_MATCH = float(os.environ.get("DIARIZATION_WORD_MIN_MATCH", "0.60"))
+# Word decision uses the voice print only. A word joins a print at cosine >= 0.80.
+# A new person is opened only when a real run of words is at or below 0.72 against
+# every known print. Small print noise does not create a speaker.
+DIAR_WORD_WINDOW_S = float(os.environ.get("DIARIZATION_WORD_WINDOW_S", "0.50"))
+DIAR_WORD_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WORD_SPLIT_DISTANCE", "0.75"))
+DIAR_WORD_SPLIT_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WORD_SPLIT_MAX_SIMILARITY", "0.72"))
+DIAR_WORD_MOVE_MARGIN = float(os.environ.get("DIARIZATION_WORD_MOVE_MARGIN", "0.10"))
+DIAR_WORD_MIN_MATCH = float(os.environ.get("DIARIZATION_WORD_MIN_MATCH", "0.80"))
+DIAR_WORD_MIN_NEW_WORDS = int(os.environ.get("DIARIZATION_WORD_MIN_NEW_WORDS", "4"))
+DIAR_WORD_MIN_NEW_SECONDS = float(os.environ.get("DIARIZATION_WORD_MIN_NEW_SECONDS", "0.80"))
 DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
 DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
 DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
@@ -1011,7 +1012,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 4
+DIAG_PATCH_VERSION = 5
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
 
@@ -1586,116 +1587,149 @@ def _robust_center(rows):
     return center / max(float(np.linalg.norm(center)), 1e-8)
 
 
-def _retie_words_by_voice(embedding_model, audio, segments):
-    """Give every word its own voice print and fix labels from that print.
+def _word_clip(audio, start_s, end_s, target_s):
+    """Audio of this word only. Short words are repeated, never padded with silence.
 
-    Time overlap only decides the first guess. A word at the start of a turn is
-    moved when its print matches the other person. A run of words inside one
-    label whose print is different becomes a new speaker, so one person is not
-    swallowed for the whole middle of the clip.
+    Silence padding makes one voice look like several prints. Repeating the word
+    keeps its spectrum and gives the embedding model a stable length.
+    """
+    start = max(0, int(float(start_s) * SAMPLE_RATE))
+    end = min(len(audio), int(float(end_s) * SAMPLE_RATE))
+    if end <= start:
+        return None
+    clip = np.ascontiguousarray(audio[start:end], dtype=np.float32)
+    minimum = int(0.30 * SAMPLE_RATE)
+    if clip.size < minimum:
+        return None
+    target = int(target_s * SAMPLE_RATE)
+    if clip.size >= target:
+        extra = clip.size - target
+        offset = extra // 2
+        clip = clip[offset:offset + target]
+    else:
+        repeats = int(np.ceil(target / float(clip.size)))
+        clip = np.tile(clip, repeats)[:target]
+    rms = float(np.sqrt(np.mean(np.square(clip.astype(np.float64)))))
+    if rms < 0.008:
+        return None
+    return clip
+
+
+def _embed_word_clips(embedding_model, clips):
+    win = clips[0].shape[0]
+    batch = []
+    vectors = []
+
+    def flush():
+        if not batch:
+            return
+        stacked = np.stack(batch).astype(np.float32, copy=False)
+        tensor = torch.from_numpy(stacked[:, None, :])
+        embedded = np.asarray(embedding_model(tensor), dtype=np.float32)
+        if embedded.ndim == 1:
+            embedded = embedded.reshape(1, -1)
+        vectors.append(embedded)
+        batch.clear()
+
+    for clip in clips:
+        if clip.shape[0] != win:
+            clip = clip[:win] if clip.shape[0] > win else np.pad(clip, (0, win - clip.shape[0]), mode="edge")
+        batch.append(clip)
+        if len(batch) >= 8:
+            flush()
+    flush()
+    if not vectors:
+        return None
+    return np.vstack(vectors)
+
+
+def _retie_words_by_voice(embedding_model, audio, segments):
+    """Assign every reliable word by voice print alone.
+
+    The current label is only a guess. A word moves when another known print
+    matches it clearly. A new speaker is opened only for a real run of words
+    whose print is far from every known voice. A small change inside one voice
+    does not open a speaker.
     """
     if embedding_model is None or audio is None or len(audio) == 0:
         return {"status": "skipped", "reason": "no_embedding_model"}
-    half = int(DIAR_WORD_WINDOW_S * SAMPLE_RATE / 2)
-    limit = len(audio)
-    words = []
-    spans = []
+    matched = []
+    clips = []
     for segment in segments:
         for word in segment.get("words") or []:
             if word.get("start") is None or not word.get("speaker"):
                 continue
             start = float(word["start"])
             end = float(word["end"]) if word.get("end") is not None else start
-            mid = int(((start + end) / 2.0) * SAMPLE_RATE)
-            clip_start = max(0, mid - half)
-            clip_end = min(limit, mid + half)
-            if clip_end - clip_start < int(0.28 * SAMPLE_RATE):
+            clip = _word_clip(audio, start, max(end, start + 0.05), DIAR_WORD_WINDOW_S)
+            if clip is None:
                 continue
-            words.append(word)
-            spans.append((clip_start, clip_end))
-    if len(words) < 4:
-        return {"status": "skipped", "reason": "too_few_words", "words": len(words)}
-    by_start = []
-    min_samples = int(0.28 * SAMPLE_RATE)
-    for word, (sample_start, sample_end) in zip(words, spans):
-        clip = audio[sample_start:sample_end]
-        if clip.size < min_samples:
-            continue
-        rms = float(np.sqrt(np.mean(np.square(clip.astype(np.float64)))))
-        if rms < 0.008:
-            continue
-        by_start.append(word)
-    kept, matrix = _embed_spans(
-        embedding_model, audio, spans, DIAR_WORD_WINDOW_S, min_samples=min_samples,
-    )
-    if matrix is None or len(kept) < 4 or len(by_start) != len(kept):
-        return {
-            "status": "skipped",
-            "reason": "too_few_embeddings",
-            "words": 0 if matrix is None else int(len(kept)),
-        }
-    matched = by_start
-    matrix = _normalize_rows(matrix)
-    used = {str(word.get("speaker")) for word in matched}
-    speakers = sorted(used)
+            matched.append(word)
+            clips.append(clip)
+    if len(matched) < 4:
+        return {"status": "skipped", "reason": "too_few_words", "words": len(matched)}
+    embedded = _embed_word_clips(embedding_model, clips)
+    if embedded is None or len(embedded) != len(matched):
+        return {"status": "skipped", "reason": "embedding_failed", "words": len(matched)}
+    finite = np.all(np.isfinite(embedded), axis=1)
+    if not np.all(finite):
+        matched = [word for word, ok in zip(matched, finite) if ok]
+        embedded = embedded[finite]
+    if len(matched) < 4:
+        return {"status": "skipped", "reason": "too_few_words", "words": len(matched)}
+    matrix = _normalize_rows(embedded)
+    by_speaker = {}
+    for index, word in enumerate(matched):
+        by_speaker.setdefault(str(word.get("speaker")), []).append(index)
+    centers = {}
+    pending = []
+    for speaker, indexes in by_speaker.items():
+        labels, _similarity = _cluster_embeddings(
+            matrix[indexes], DIAR_WORD_SPLIT_DISTANCE, min_clusters=1, max_clusters=4
+        )
+        buckets = {}
+        for label, index in zip(_compact_labels(labels), indexes):
+            buckets.setdefault(int(label), []).append(index)
+        earliest = min(indexes, key=lambda index: float(matched[index]["start"]))
+        anchor_label = next(label for label, members in buckets.items() if earliest in members)
+        centers[speaker] = _robust_center(matrix[buckets[anchor_label]])
+        for label, members in buckets.items():
+            if label != anchor_label:
+                pending.append(members)
     splits = 0
-    for speaker in speakers:
-        indexes = [index for index, word in enumerate(matched) if str(word.get("speaker")) == speaker]
-        if len(indexes) < 4:
+    used = set(centers)
+    for members in pending:
+        if len(members) < 2:
             continue
-        group = matrix[indexes]
-        times = []
-        for index in indexes:
+        duration = 0.0
+        for index in members:
             word = matched[index]
             start = float(word["start"])
             end = float(word["end"]) if word.get("end") is not None else start
-            times.append((start, max(end, start + 0.05)))
-        labels, _similarity = _cluster_embeddings(
-            group, DIAR_WORD_SPLIT_DISTANCE, min_clusters=1, max_clusters=4
-        )
-        labels = _fold_short_if_same_voice(
-            times, labels, _normalize_rows(group), 0.35, DIAR_WORD_SPLIT_MAX_SIMILARITY
-        )
-        labels = _compact_labels(labels)
-        similarity = _min_centroid_cosine(_normalize_rows(group), labels)
-        found = sorted(set(int(value) for value in labels))
-        if len(found) < 2 or similarity > DIAR_WORD_SPLIT_MAX_SIMILARITY:
+            duration += max(0.0, max(end, start + 0.05) - start)
+        if len(members) < DIAR_WORD_MIN_NEW_WORDS and duration < DIAR_WORD_MIN_NEW_SECONDS:
             continue
-        durations = {}
-        counts = {}
-        for label, (start, end) in zip(labels, times):
-            durations[int(label)] = durations.get(int(label), 0.0) + max(0.0, end - start)
-            counts[int(label)] = counts.get(int(label), 0) + 1
-        primary = max(found, key=lambda label: (durations.get(label, 0.0), counts.get(label, 0)))
-        rename = {primary: speaker}
-        for label in found:
-            if label == primary:
-                continue
-            if counts.get(label, 0) < 2 or durations.get(label, 0.0) < 0.35:
-                rename[label] = speaker
-                continue
-            rename[label] = _next_speaker_name(used)
-            splits += 1
-        for index, label in zip(indexes, labels):
-            matched[index]["speaker"] = rename[int(label)]
-    centroids = {}
-    for index, word in enumerate(matched):
-        speaker = str(word.get("speaker"))
-        centroids.setdefault(speaker, []).append(matrix[index])
-    centers = {speaker: _robust_center(rows) for speaker, rows in centroids.items()}
+        center = _robust_center(matrix[members])
+        nearest = max(float(np.dot(center, known)) for known in centers.values())
+        if nearest > DIAR_WORD_SPLIT_MAX_SIMILARITY:
+            continue
+        name = _next_speaker_name(used)
+        centers[name] = center
+        for index in members:
+            matched[index]["speaker"] = name
+        splits += 1
     moved = 0
     names = list(centers)
     if len(names) >= 2:
         for index, word in enumerate(matched):
             current = str(word.get("speaker"))
-            if current not in centers:
-                continue
             scores = {name: float(np.dot(matrix[index], centers[name])) for name in names}
             best = max(names, key=lambda name: scores[name])
+            current_score = scores.get(current, -1.0)
             if (
                 best != current
                 and scores[best] >= DIAR_WORD_MIN_MATCH
-                and scores[best] >= scores[current] + DIAR_WORD_MOVE_MARGIN
+                and scores[best] >= current_score + DIAR_WORD_MOVE_MARGIN
             ):
                 word["speaker"] = best
                 moved += 1
@@ -1704,7 +1738,8 @@ def _retie_words_by_voice(embedding_model, audio, segments):
         "words": len(matched),
         "splits": int(splits),
         "moved": int(moved),
-        "window_s": DIAR_WORD_WINDOW_S,
+        "match_min_cosine": DIAR_WORD_MIN_MATCH,
+        "new_speaker_max_cosine": DIAR_WORD_SPLIT_MAX_SIMILARITY,
     }
 
 
