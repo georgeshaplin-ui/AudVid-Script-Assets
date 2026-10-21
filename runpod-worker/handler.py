@@ -42,11 +42,17 @@ DIAR_MIN_ACTIVE_RATIO = float(os.environ.get("DIARIZATION_MIN_ACTIVE_RATIO", "0.
 # windows stay in one cluster.
 DIAR_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_SPLIT_DISTANCE", "0.38"))
 DIAR_MAX_SPLIT_SIMILARITY = float(os.environ.get("DIARIZATION_MAX_SPLIT_SIMILARITY", "0.96"))
-# Re-check each Pyannote label on its own windows. 0.70 Euclidean on unit vectors is
-# cosine similarity ≈ 0.76: only clearly different voices split. A shout or a pitch
-# change stays one person. This does not change Pyannote's own VBx threshold.
-DIAR_WITHIN_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WITHIN_SPLIT_DISTANCE", "0.70"))
-DIAR_WITHIN_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WITHIN_MAX_SIMILARITY", "0.75"))
+# Re-check each Pyannote label on short windows. 0.45 Euclidean on unit vectors is
+# cosine similarity ≈ 0.90, so two voices split unless they are nearly the same print.
+# A fast interruption is shorter than the old 1.25s window, which was mixing both
+# people into one vector. Pyannote's own VBx threshold is unchanged.
+DIAR_WITHIN_SPLIT_DISTANCE = float(os.environ.get("DIARIZATION_WITHIN_SPLIT_DISTANCE", "0.45"))
+DIAR_WITHIN_MAX_SIMILARITY = float(os.environ.get("DIARIZATION_WITHIN_MAX_SIMILARITY", "0.90"))
+DIAR_WITHIN_WINDOW_S = float(os.environ.get("DIARIZATION_WITHIN_WINDOW_S", "0.50"))
+DIAR_WITHIN_HOP_S = float(os.environ.get("DIARIZATION_WITHIN_HOP_S", "0.25"))
+DIAR_WITHIN_MIN_SPAN_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPAN_S", "0.35"))
+DIAR_WITHIN_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPEAKER_S", "0.30"))
+DIAR_WITHIN_MAX_CLUSTERS = int(os.environ.get("DIARIZATION_WITHIN_MAX_CLUSTERS", "4"))
 DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
 DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
 DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
@@ -567,8 +573,10 @@ def _speech_spans(audio, annotation, window_s):
     return spans
 
 
-def _embed_spans(embedding_model, audio, spans, window_s):
+def _embed_spans(embedding_model, audio, spans, window_s, min_samples=None):
     win = int(window_s * SAMPLE_RATE)
+    if min_samples is None:
+        min_samples = SAMPLE_RATE
     batch = []
     kept = []
     vectors = []
@@ -586,7 +594,7 @@ def _embed_spans(embedding_model, audio, spans, window_s):
 
     for start, end in spans:
         clip = np.ascontiguousarray(audio[start:end], dtype=np.float32)
-        if clip.size < SAMPLE_RATE:
+        if clip.size < min_samples:
             continue
         rms = float(np.sqrt(np.mean(np.square(clip))))
         if rms < 0.008:
@@ -688,10 +696,11 @@ def _probe_speakers(model, audio, annotation, num_speakers, min_speakers, max_sp
     return target, similarity, kept, labels
 
 
-def _speaker_windows(audio, annotation, speaker, window_s):
-    """Non-overlapping windows inside one Pyannote speaker. Same geometry as _speech_spans."""
-    win = int(window_s * SAMPLE_RATE)
-    minimum = int(SAMPLE_RATE)
+def _speaker_windows(audio, annotation, speaker, window_s, hop_s=None, min_s=1.0):
+    """Windows inside one Pyannote speaker. Hop may be shorter than the window."""
+    win = max(1, int(window_s * SAMPLE_RATE))
+    hop = win if hop_s is None else max(1, int(hop_s * SAMPLE_RATE))
+    minimum = max(1, int(min_s * SAMPLE_RATE))
     spans = []
     for segment, _, label in annotation.itertracks(yield_label=True):
         if str(label) != str(speaker):
@@ -702,17 +711,68 @@ def _speaker_windows(audio, annotation, speaker, window_s):
         end = max(start, min(end, len(audio)))
         if end - start < minimum:
             continue
-        if end - start < win:
+        if end - start <= win:
             spans.append((start, end))
             continue
         cursor = start
-        while cursor + win <= end:
-            spans.append((cursor, cursor + win))
-            cursor += win
-        tail = end - cursor
-        if tail >= minimum:
-            spans.append((cursor, end))
+        while cursor + minimum <= end:
+            spans.append((cursor, min(end, cursor + win)))
+            if cursor + win >= end:
+                break
+            cursor += hop
+    cap = 480
+    if len(spans) > cap:
+        chosen = np.linspace(0, len(spans) - 1, cap).astype(int)
+        spans = [spans[int(index)] for index in chosen]
     return spans
+
+
+def _fold_short_if_same_voice(spans, labels, matrix, min_seconds, max_similarity):
+    """Fold a short fragment only when it is still the same voice as a longer one.
+
+    A short reply with a different print is kept. That is the fast-argument case:
+    a few words of a second person must not disappear into the surrounding speaker.
+    """
+    labels = np.asarray(labels, dtype=int).copy()
+    durations = {}
+    for label, (start, end) in zip(labels, spans):
+        durations[int(label)] = durations.get(int(label), 0.0) + max(0.0, float(end) - float(start))
+    long = [label for label, duration in durations.items() if duration >= min_seconds]
+    if not long:
+        return labels
+    centroids = {}
+    for label in long:
+        centroid = matrix[labels == label].mean(axis=0)
+        centroids[label] = centroid / max(float(np.linalg.norm(centroid)), 1e-8)
+    for label, duration in durations.items():
+        if duration >= min_seconds or not np.any(labels == label):
+            continue
+        point = matrix[labels == label].mean(axis=0)
+        point = point / max(float(np.linalg.norm(point)), 1e-8)
+        nearest = max(long, key=lambda item: float(np.dot(point, centroids[item])))
+        if float(np.dot(point, centroids[nearest])) > max_similarity:
+            labels[labels == label] = nearest
+    return labels
+
+
+def _collapse_named_windows(windows):
+    by_name = {}
+    for start, end, name in windows:
+        by_name.setdefault(name, []).append((float(start), float(end)))
+    tracks = []
+    for name, spans in by_name.items():
+        spans.sort()
+        merged = []
+        for start, end in spans:
+            if merged and start <= merged[-1][1] + 0.05:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        for start, end in merged:
+            if end - start >= 0.05:
+                tracks.append((start, end, name))
+    tracks.sort()
+    return tracks
 
 
 def _annotation_from_named(tracks):
@@ -728,18 +788,18 @@ def _annotation_from_named(tracks):
 
 
 def _split_within_speakers(model, audio, annotation):
-    """Split one Pyannote label when its own windows are not the same voice.
+    """Split one Pyannote label when its own short windows are not the same voice.
 
-    Different Pyannote labels are never merged. A split is kept only when the
-    centroid cosine is at or below DIAR_MAX_SPLIT_SIMILARITY (near-copies stay one
-    person: shout, pitch, volume). Returns (annotation or None, split_count, notes).
+    Different Pyannote labels are never merged. A split is kept when the centroid
+    cosine is at or below DIAR_WITHIN_MAX_SIMILARITY. A short fragment is folded
+    back only when it still matches the longer voice, so a fast reply survives.
     """
     embedding_model = getattr(model, "_embedding", None)
     if embedding_model is None or annotation is None or len(annotation) == 0:
         return None, 0, [{
             "reason": "no_embedding_model" if embedding_model is None else "no_annotation",
         }]
-    window_s = _probe_window_s(audio)
+    window_s = DIAR_WITHIN_WINDOW_S
     durations = {}
     for segment, _, label in annotation.itertracks(yield_label=True):
         name = str(label)
@@ -749,7 +809,7 @@ def _split_within_speakers(model, audio, annotation):
     tracks = []
     notes = []
     splits = 0
-    ceiling = max(DIAR_MAX_AUTO_SPEAKERS, len(order)) + 4
+    ceiling = max(DIAR_MAX_AUTO_SPEAKERS, len(order)) + 8
     for speaker in order:
         original = []
         for segment, _, label in annotation.itertracks(yield_label=True):
@@ -758,8 +818,16 @@ def _split_within_speakers(model, audio, annotation):
         if len(used) >= ceiling:
             tracks.extend(original)
             continue
-        spans = _speaker_windows(audio, annotation, speaker, window_s)
-        kept, matrix = _embed_spans(embedding_model, audio, spans, window_s) if len(spans) >= 2 else ([], None)
+        spans = _speaker_windows(
+            audio, annotation, speaker, window_s, DIAR_WITHIN_HOP_S, DIAR_WITHIN_MIN_SPAN_S
+        )
+        kept, matrix = (
+            _embed_spans(
+                embedding_model, audio, spans, window_s,
+                min_samples=int(DIAR_WITHIN_MIN_SPAN_S * SAMPLE_RATE),
+            )
+            if len(spans) >= 2 else ([], None)
+        )
         if matrix is None or len(kept) < 2:
             tracks.extend(original)
             notes.append({"speaker": speaker, "windows": len(kept), "split": False, "reason": "too_few_windows"})
@@ -772,12 +840,14 @@ def _split_within_speakers(model, audio, annotation):
             tracks.extend(original)
             notes.append({"speaker": speaker, "windows": len(kept), "split": False, "reason": "non_finite"})
             continue
-        room = max(2, min(3, ceiling - len(used) + 1))
+        room = max(2, min(DIAR_WITHIN_MAX_CLUSTERS, ceiling - len(used) + 1))
         labels, _similarity = _cluster_embeddings(
             matrix, DIAR_WITHIN_SPLIT_DISTANCE, min_clusters=1, max_clusters=room
         )
         normalized = _normalize_rows(matrix)
-        labels = _fold_short_clusters(kept, labels, normalized, DIAR_MIN_SPEAKER_S, protect=1)
+        labels = _fold_short_if_same_voice(
+            kept, labels, normalized, DIAR_WITHIN_MIN_SPEAKER_S, DIAR_WITHIN_MAX_SIMILARITY
+        )
         labels = _compact_labels(labels)
         similarity = _min_centroid_cosine(normalized, labels)
         found = len(set(int(value) for value in labels))
@@ -808,8 +878,10 @@ def _split_within_speakers(model, audio, annotation):
                     rename[label] = candidate
                     used.add(candidate)
                     break
+        named = []
         for (start, end), label in zip(kept, labels):
-            tracks.append((float(start), float(end), rename[int(label)]))
+            named.append((float(start), float(end), rename[int(label)]))
+        tracks.extend(_collapse_named_windows(named))
         splits += found - 1
         notes.append({
             "speaker": speaker,
@@ -931,7 +1003,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 2
+DIAG_PATCH_VERSION = 3
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
 
@@ -970,6 +1042,9 @@ def _effective_settings(model):
             "max_split_similarity": DIAR_MAX_SPLIT_SIMILARITY,
             "within_split_distance_euclidean": DIAR_WITHIN_SPLIT_DISTANCE,
             "within_max_similarity": DIAR_WITHIN_MAX_SIMILARITY,
+            "within_window_s": DIAR_WITHIN_WINDOW_S,
+            "within_hop_s": DIAR_WITHIN_HOP_S,
+            "within_min_speaker_s": DIAR_WITHIN_MIN_SPEAKER_S,
             "window_s": DIAR_WINDOW_S,
             "max_windows": DIAR_MAX_WINDOWS,
             "min_speaker_s": DIAR_MIN_SPEAKER_S,
@@ -1246,6 +1321,9 @@ def _build_diarization_debug(rescue, speakers, segments, rows, job_id=None, dura
             "max_split_similarity": DIAR_MAX_SPLIT_SIMILARITY,
             "within_split_distance_euclidean": DIAR_WITHIN_SPLIT_DISTANCE,
             "within_max_similarity": DIAR_WITHIN_MAX_SIMILARITY,
+            "within_window_s": DIAR_WITHIN_WINDOW_S,
+            "within_hop_s": DIAR_WITHIN_HOP_S,
+            "within_min_speaker_s": DIAR_WITHIN_MIN_SPEAKER_S,
         },
         "audio_prep": extra.get("audio_prep"),
         "trigger": extra.get("trigger"),
@@ -1390,16 +1468,78 @@ def _collect_speakers(segments, rows):
     return sorted(found)
 
 
+def _bind_words(segments, rows):
+    """Keep a word with the speaker who started it.
+
+    whisperx's max-overlap rule gives the last words of a turn to the next person
+    when the timestamp spills a little past the cut. A word moves to the other
+    speaker only when that speaker clearly owns most of the word. A word sitting
+    in a short gap stays with the speaker who just finished, not the one about to start.
+    """
+    if not rows:
+        return segments
+    previous_speaker = None
+    previous_end = None
+    for segment in segments:
+        for word in segment.get("words") or []:
+            if word.get("start") is None:
+                continue
+            start = float(word["start"])
+            end = float(word["end"]) if word.get("end") is not None else start
+            if end < start:
+                end = start
+            duration = max(end - start, 0.05)
+            overlaps = []
+            starters = []
+            for row in rows:
+                overlap = min(end, float(row["end"])) - max(start, float(row["start"]))
+                if overlap > 0:
+                    overlaps.append((overlap, row))
+                if float(row["start"]) <= start < float(row["end"]):
+                    starters.append(row)
+            chosen = None
+            if starters:
+                starter = max(
+                    starters,
+                    key=lambda row: min(end, float(row["end"])) - max(start, float(row["start"])),
+                )
+                starter_overlap = min(end, float(starter["end"])) - max(start, float(starter["start"]))
+                chosen = starter["speaker"]
+                if overlaps:
+                    best_overlap, best_row = max(overlaps, key=lambda item: item[0])
+                    if (
+                        best_row["speaker"] != chosen
+                        and best_overlap >= starter_overlap + 0.18
+                        and best_overlap >= 0.55 * duration
+                    ):
+                        chosen = best_row["speaker"]
+            elif overlaps:
+                best_overlap, best_row = max(overlaps, key=lambda item: item[0])
+                if best_overlap >= 0.35 * duration:
+                    chosen = best_row["speaker"]
+            if (
+                chosen is None
+                and previous_speaker is not None
+                and previous_end is not None
+                and 0.0 <= start - previous_end <= 0.40
+            ):
+                chosen = previous_speaker
+            if chosen:
+                word["speaker"] = str(chosen)
+                previous_speaker = str(chosen)
+                previous_end = end
+            elif previous_end is not None and start - previous_end > 0.40:
+                previous_speaker = None
+                previous_end = None
+    return segments
+
+
 def _assign_speakers(result, annotation):
     rows = _rows_from_annotation(annotation)
     if not rows or not result.get("segments"):
         return result, rows
-    frame = pd.DataFrame(rows)
-    assigned = whisperx.assign_word_speakers(frame, result, fill_nearest=True)
-    assigned["segments"] = _split_segments_by_speaker(
-        _fill_word_speakers(assigned.get("segments") or [], rows)
-    )
-    return assigned, rows
+    result["segments"] = _split_segments_by_speaker(_bind_words(result.get("segments") or [], rows))
+    return result, rows
 
 
 def handler(job):

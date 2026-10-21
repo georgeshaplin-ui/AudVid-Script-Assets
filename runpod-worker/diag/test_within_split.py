@@ -302,6 +302,45 @@ def main():
     if kept_labels != {"SPEAKER_00", "SPEAKER_01"} or kept_code == "within_speaker_embedding_split":
         failures.append(f"distinct Pyannote labels were merged or rewritten: {kept_labels} {kept_code}")
 
+    def level_split(low_vector):
+        class LevelEmbedding:
+            def __call__(self, tensor):
+                clips = tensor.arr[:, 0, :]
+                out = []
+                for clip in clips:
+                    out.append([1.0, 0.0, 0.0] if float(np.mean(clip)) > 0.15 else low_vector)
+                return np.asarray(out, dtype=np.float32)
+
+        audio = np.concatenate([
+            np.full(3 * SR, 0.30, dtype=np.float32),
+            np.full(3 * SR, 0.05, dtype=np.float32),
+        ])
+        model = types.SimpleNamespace(_embedding=LevelEmbedding())
+        annotation = make_annotation([(0, 6, "SPEAKER_00")])
+        return module._split_within_speakers(model, audio, annotation)
+
+    different, different_splits, different_notes = level_split([0.80, 0.60, 0.0])
+    if different_splits < 1 or different is None:
+        failures.append(f"cosine 0.80 voices stayed merged: {different_notes}")
+    same_print, same_splits, same_notes = level_split([0.995, 0.100, 0.0])
+    if same_splits != 0 or same_print is not None:
+        failures.append(f"near-copy voice was split: splits={same_splits} notes={same_notes}")
+
+    rows = [
+        {"start": 0.0, "end": 2.0, "speaker": "SPEAKER_00"},
+        {"start": 2.0, "end": 4.0, "speaker": "SPEAKER_01"},
+    ]
+    bound = module._bind_words([{
+        "words": [
+            {"word": "last", "start": 1.60, "end": 2.08},
+            {"word": "held", "start": 1.55, "end": 1.75},
+            {"word": "next", "start": 2.15, "end": 2.40},
+        ]
+    }], rows)
+    tags = [word["speaker"] for word in bound[0]["words"]]
+    if tags != ["SPEAKER_00", "SPEAKER_00", "SPEAKER_01"]:
+        failures.append(f"boundary words moved to the next speaker: {tags}")
+
     if failures:
         print("WITHIN_SPLIT_FAILED")
         for message in failures:
