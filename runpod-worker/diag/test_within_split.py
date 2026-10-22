@@ -293,14 +293,14 @@ def main():
     if n_splits != 0 or split_ann is not None:
         failures.append(f"one voice was split: splits={n_splits} notes={notes}")
 
-    # Two Pyannote labels stay two even when every window embedding is identical.
+    # Identical embeddings are one voice. Pyannote's two labels do not count.
     module._load_mono_16k = lambda path: (two_voices.copy(), {"decoder": "stub", "source_sr": SR, "source_channels": 1})
     kept = [([(0, 6, "SPEAKER_00"), (6, 12, "SPEAKER_01")], [(0, 6, "SPEAKER_00"), (6, 12, "SPEAKER_01")])]
     out_keep, _model = run(module, kept, words, embedding="constant")
     kept_labels = {row["speaker"] for row in out_keep.get("diarization") or []}
     kept_code = (out_keep.get("diarization_debug") or {}).get("replacement", {}).get("reason_code")
-    if kept_labels != {"SPEAKER_00", "SPEAKER_01"} or kept_code == "within_speaker_embedding_split":
-        failures.append(f"distinct Pyannote labels were merged or rewritten: {kept_labels} {kept_code}")
+    if kept_labels != {"SPEAKER_00"} or kept_code == "within_speaker_embedding_split":
+        failures.append(f"identical voice print stayed split: {kept_labels} {kept_code}")
 
     def level_split(low_vector):
         class LevelEmbedding:
@@ -438,6 +438,67 @@ def main():
     mild_labels = {item["speaker"] for item in mild[0]["words"]}
     if mild_labels != {"SPEAKER_00"} or mild_info.get("splits"):
         failures.append(f"unchanged voice print was split: {mild_labels} {mild_info}")
+
+    class CloseVoice:
+        def __call__(self, tensor):
+            clips = tensor.arr[:, 0, :]
+            out = []
+            for clip in clips:
+                if float(np.mean(np.abs(clip))) > 0.2:
+                    out.append([1.0, 0.0, 0.0])
+                else:
+                    out.append([0.83, 0.55776, 0.0])
+            return np.asarray(out, dtype=np.float32)
+
+    close_audio = np.concatenate([
+        np.full(3 * SR, 0.30, dtype=np.float32),
+        np.full(3 * SR, 0.10, dtype=np.float32),
+    ])
+    close_words = [{"words": [
+        word(0.3, 0.8, "SPEAKER_00"),
+        word(1.0, 1.5, "SPEAKER_00"),
+        word(1.7, 2.2, "SPEAKER_00"),
+        word(2.4, 2.9, "SPEAKER_00"),
+        word(3.3, 3.8, "SPEAKER_00"),
+        word(4.0, 4.5, "SPEAKER_00"),
+        word(4.7, 5.2, "SPEAKER_00"),
+        word(5.4, 5.9, "SPEAKER_00"),
+    ]}]
+    close_info = module._retie_words_by_voice(CloseVoice(), close_audio, close_words)
+    close_early = {item["speaker"] for item in close_words[0]["words"] if item["start"] < 3.0}
+    close_late = {item["speaker"] for item in close_words[0]["words"] if item["start"] >= 3.0}
+    if close_info.get("status") != "ran" or close_early == close_late or len(close_early) != 1 or len(close_late) != 1:
+        failures.append(f"sustained nearby voice was swallowed: {close_info} early={close_early} late={close_late}")
+
+    class BlipVoice:
+        def __call__(self, tensor):
+            clips = tensor.arr[:, 0, :]
+            out = []
+            for clip in clips:
+                level = float(np.mean(np.abs(clip)))
+                if 0.12 < level < 0.22:
+                    out.append([0.0, 1.0, 0.0])
+                else:
+                    out.append([1.0, 0.0, 0.0])
+            return np.asarray(out, dtype=np.float32)
+
+    blip_audio = np.concatenate([
+        np.full(3 * SR, 0.30, dtype=np.float32),
+        np.full(int(0.5 * SR), 0.16, dtype=np.float32),
+        np.full(2 * SR, 0.30, dtype=np.float32),
+    ])
+    blip_words = [{"words": [
+        word(0.3, 0.8, "SPEAKER_00"),
+        word(1.0, 1.5, "SPEAKER_00"),
+        word(1.7, 2.2, "SPEAKER_00"),
+        word(3.05, 3.45, "SPEAKER_02"),
+        word(3.8, 4.3, "SPEAKER_00"),
+        word(4.5, 5.0, "SPEAKER_00"),
+    ]}]
+    blip_info = module._retie_words_by_voice(BlipVoice(), blip_audio, blip_words)
+    blip_labels = [item["speaker"] for item in blip_words[0]["words"]]
+    if len(set(blip_labels)) != 1 or blip_info.get("prints") != 1:
+        failures.append(f"one odd word opened a speaker: {blip_labels} {blip_info}")
 
     if failures:
         print("WITHIN_SPLIT_FAILED")
