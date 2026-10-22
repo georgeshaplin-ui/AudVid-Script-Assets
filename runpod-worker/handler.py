@@ -1041,7 +1041,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 6
+DIAG_PATCH_VERSION = 7
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
 
@@ -1688,6 +1688,47 @@ def _mean_cosine(matrix, indexes, center):
     return float(np.mean(matrix[list(indexes)].dot(center)))
 
 
+def _rounded_print(row):
+    return [round(float(value), 4) for value in row]
+
+
+def _word_print_records(words, reliable, matrix, centers, names):
+    """Diagnostic list only. Built after the speaker labels are already chosen.
+
+    The word text is a label for the measurement. It is not read by clustering.
+    """
+    position = {word_index: place for place, word_index in enumerate(reliable)}
+    records = []
+    for word_index, word in enumerate(words):
+        start, end, _duration = _word_duration(word)
+        record = {
+            "index": word_index + 1,
+            "word": str(word.get("word") or ""),
+            "start": round(float(start), 3),
+            "end": round(float(end), 3),
+            "speaker": str(word.get("speaker") or ""),
+        }
+        place = position.get(word_index)
+        if place is None:
+            record["extracted"] = False
+            record["reason"] = "too_short_or_quiet"
+        else:
+            row = matrix[place]
+            record["extracted"] = True
+            record["dim"] = int(len(row))
+            record["vector"] = _rounded_print(row)
+            record["cosine_to_prints"] = {
+                names[print_index]: round(float(np.dot(row, center)), 4)
+                for print_index, center in enumerate(centers)
+            }
+        records.append(record)
+    centers_out = [
+        {"speaker": names[print_index], "vector": _rounded_print(center)}
+        for print_index, center in enumerate(centers)
+    ]
+    return records, centers_out
+
+
 def _retie_words_by_voice(embedding_model, audio, segments):
     """Give every word the nearest sustained voice print.
 
@@ -1873,6 +1914,7 @@ def _retie_words_by_voice(embedding_model, audio, segments):
     moved = sum(
         1 for index, name in enumerate(original) if str(words[reliable[index]].get("speaker")) != name
     )
+    word_prints, print_centers = _word_print_records(words, reliable, matrix, centers, names)
     return {
         "status": "ran",
         "words": len(reliable),
@@ -1881,6 +1923,9 @@ def _retie_words_by_voice(embedding_model, audio, segments):
         "prints": len(final_names),
         "match_min_cosine": DIAR_PRINT_JOIN,
         "new_speaker_max_cosine": DIAR_PRINT_BORDER,
+        "embedding_dim": int(matrix.shape[1]),
+        "word_prints": word_prints,
+        "print_centers": print_centers,
     }
 
 

@@ -403,11 +403,22 @@ def main():
         word(1.6, 2.0, "SPEAKER_00"),
         word(2.4, 2.8, "SPEAKER_00"),
         word(3.1, 3.5, "SPEAKER_00"),
+        word(3.6, 3.7, "SPEAKER_00"),
     ]}]
     same_info = module._retie_words_by_voice(MeanEmbedding(), same_audio, same)
     same_labels = {item["speaker"] for item in same[0]["words"]}
     if same_labels != {"SPEAKER_00"} or same_info.get("splits"):
         failures.append(f"one voice was split by the word pass: {same_labels} {same_info}")
+    extracted_prints = [item for item in (same_info.get("word_prints") or []) if item.get("extracted")]
+    missed_prints = [item for item in (same_info.get("word_prints") or []) if not item.get("extracted")]
+    if len(extracted_prints) != 5 or len(missed_prints) != 1:
+        failures.append(
+            f"word prints should be 5 extracted and 1 too short, got {len(extracted_prints)} and {len(missed_prints)}"
+        )
+    elif len(extracted_prints[0].get("vector") or []) != 3 or "SPEAKER_00" not in (extracted_prints[0].get("cosine_to_prints") or {}):
+        failures.append(f"extracted word print is missing its vector: {extracted_prints[0]}")
+    elif missed_prints[0].get("reason") != "too_short_or_quiet":
+        failures.append(f"short word was not marked unmeasured: {missed_prints[0]}")
 
     class MildEmbedding:
         def __call__(self, tensor):
