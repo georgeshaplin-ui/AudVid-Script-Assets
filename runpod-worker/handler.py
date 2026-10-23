@@ -420,6 +420,124 @@ def _restore_pyannote_stock(model):
         clustering.filter_embeddings = original
 
 
+# community-1 / pyannote.audio 4.0.0. VBx declares these Uniform ranges, and the
+# powerset segmentation declares min_duration_off. Defaults are default_parameters().
+# Speaker counts are the pipeline call arguments. Empty means Pyannote decides.
+# 20 is the upper stop of this control, not a second clustering algorithm.
+_RAW_RANGES = {
+    "threshold": (0.5, 0.8),
+    "Fa": (0.01, 0.5),
+    "Fb": (0.01, 15.0),
+    "min_duration_off": (0.0, 1.0),
+}
+_RAW_COUNT_KEYS = ("num_speakers", "min_speakers", "max_speakers")
+_RAW_COUNT_LIMIT = (1, 20)
+
+
+def _bounded_number(value, low, high):
+    """Official hyperparameter, or None when the field is absent or not a number."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return round(min(high, max(low, number)), 4)
+
+
+def _bounded_count(value, low=1, high=20):
+    """Official speaker-count argument, or None when it is blank or not an integer."""
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < low:
+        return None
+    return min(high, number)
+
+
+def _parse_pyannote_raw(payload):
+    """Read only Pyannote's own raw knobs. Any other key is ignored."""
+    parsed = {
+        "threshold": None,
+        "Fa": None,
+        "Fb": None,
+        "min_duration_off": None,
+        "num_speakers": None,
+        "min_speakers": None,
+        "max_speakers": None,
+        "min_max_swapped": False,
+        "stock": True,
+    }
+    if not isinstance(payload, dict):
+        return parsed
+    for name, (low, high) in _RAW_RANGES.items():
+        if name in payload:
+            parsed[name] = _bounded_number(payload.get(name), low, high)
+    low, high = _RAW_COUNT_LIMIT
+    for name in _RAW_COUNT_KEYS:
+        if name in payload:
+            parsed[name] = _bounded_count(payload.get(name), low, high)
+    if parsed["num_speakers"] is not None:
+        parsed["min_speakers"] = None
+        parsed["max_speakers"] = None
+    elif (
+        parsed["min_speakers"] is not None
+        and parsed["max_speakers"] is not None
+        and parsed["min_speakers"] > parsed["max_speakers"]
+    ):
+        parsed["min_speakers"], parsed["max_speakers"] = parsed["max_speakers"], parsed["min_speakers"]
+        parsed["min_max_swapped"] = True
+    parsed["stock"] = all(parsed[name] is None for name in tuple(_RAW_RANGES) + _RAW_COUNT_KEYS)
+    return parsed
+
+
+def _apply_pyannote_raw(model, payload):
+    """Restore the published pipeline, then set only the official knobs that were sent."""
+    parsed = _parse_pyannote_raw(payload)
+    _restore_pyannote_stock(model)
+    if parsed["stock"]:
+        return parsed
+    clustering = getattr(model, "clustering", None)
+    segmentation = getattr(model, "segmentation", None)
+    owners = {
+        "threshold": clustering,
+        "Fa": clustering,
+        "Fb": clustering,
+        "min_duration_off": segmentation,
+    }
+    for name, owner in owners.items():
+        if parsed[name] is not None:
+            _assign_param(owner, name, parsed[name])
+    print(
+        "[diarize] pyannote raw controls "
+        f"threshold={parsed['threshold']} Fa={parsed['Fa']} Fb={parsed['Fb']} "
+        f"min_duration_off={parsed['min_duration_off']} "
+        f"num={parsed['num_speakers']} min={parsed['min_speakers']} max={parsed['max_speakers']}",
+        flush=True,
+    )
+    return parsed
+
+
+def _public_raw_controls(raw):
+    """Compact echo of the raw knobs actually applied. Stock stays a single flag."""
+    if not isinstance(raw, dict) or raw.get("stock", True):
+        return {"stock": True}
+    public = {"stock": False}
+    for key in tuple(_RAW_RANGES) + _RAW_COUNT_KEYS:
+        if raw.get(key) is not None:
+            public[key] = raw[key]
+    if raw.get("min_max_swapped"):
+        public["min_max_swapped"] = True
+    return public
+
+
 def _configure_pipeline(model):
     params = {
         "segmentation": {"min_duration_off": DIAR_MIN_DURATION_OFF},
@@ -966,7 +1084,9 @@ def _split_within_speakers(model, audio, annotation):
     return _annotation_from_named(tracks), splits, notes
 
 
-def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers, mode="programmed"):
+def _separate_speakers(
+    pipeline, audio, num_speakers, min_speakers, max_speakers, mode="programmed", raw_controls=None
+):
     model = pipeline.model
     _diag_runs.clear()
     _diag_extra.clear()
@@ -975,12 +1095,22 @@ def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers
     _snapshot_pyannote_stock(model)
     _diag_note("job", pyannote_mode=mode)
     if mode == "raw":
-        _restore_pyannote_stock(model)
-        _diag_note("bounds", requested={"num_speakers": None, "min_speakers": None, "max_speakers": None})
-        _diag_note("bounds", effective={"num_speakers": None, "min_speakers": None, "max_speakers": None})
+        applied = _apply_pyannote_raw(model, raw_controls)
+        _diag_note("pyannote_raw", **applied)
+        raw_num = applied["num_speakers"]
+        raw_min = applied["min_speakers"]
+        raw_max = applied["max_speakers"]
+        _diag_note(
+            "bounds",
+            requested={"num_speakers": raw_num, "min_speakers": raw_min, "max_speakers": raw_max},
+        )
+        _diag_note(
+            "bounds",
+            effective={"num_speakers": raw_num, "min_speakers": raw_min, "max_speakers": raw_max},
+        )
         _diag_record_audio(audio, audio)
         _diag_record_settings(model)
-        output = _call_pipeline(model, audio, None, None, None)
+        output = _call_pipeline(model, audio, raw_num, raw_min, raw_max)
         annotation = _best_annotation(output)
         found = _label_count(annotation)
         _diag_record_s0(output, annotation)
@@ -1100,7 +1230,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 12
+DIAG_PATCH_VERSION = 13
 IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
@@ -1114,7 +1244,7 @@ def _job_pyannote_mode():
 def _worker_identity(pyannote_mode="programmed"):
     """Identity of the image that is executing this job. Baked in at build time."""
     mode = pyannote_mode if pyannote_mode in ("raw", "programmed") else "programmed"
-    return {
+    identity = {
         "image_tag": IMAGE_TAG or None,
         "base_commit": DIAG_BASE_COMMIT,
         "diag_patch": DIAG_PATCH_VERSION,
@@ -1125,6 +1255,11 @@ def _worker_identity(pyannote_mode="programmed"):
         "runpod_dc_id": os.environ.get("RUNPOD_DC_ID") or None,
         "hostname": socket.gethostname(),
     }
+    if mode == "raw":
+        raw = _diag_extra.get("pyannote_raw") if isinstance(_diag_extra, dict) else None
+        if isinstance(raw, dict):
+            identity["pyannote_raw"] = _public_raw_controls(raw)
+    return identity
 
 
 def _diag_note(section, **values):
@@ -2090,6 +2225,9 @@ def handler(job):
     pyannote_mode = str(job_input.get("pyannote_mode") or "programmed").strip().lower()
     if pyannote_mode not in ("raw", "programmed"):
         pyannote_mode = "programmed"
+    raw_controls = job_input.get("pyannote_raw") if pyannote_mode == "raw" else None
+    if not isinstance(raw_controls, dict):
+        raw_controls = None
     hf_token = job_input.get("huggingface_access_token") or os.environ.get("HF_TOKEN")
     if diarization and not hf_token:
         return {"error": "huggingface_access_token (or HF_TOKEN env) is required for diarization"}
@@ -2140,6 +2278,7 @@ def handler(job):
                 min_speakers=_optional_int(job_input, "min_speakers"),
                 max_speakers=_optional_int(job_input, "max_speakers"),
                 mode=pyannote_mode,
+                raw_controls=raw_controls,
             )
             prepared = audio if pyannote_mode == "raw" else _prepare_diarization_audio(audio)
             embedding_model = getattr(getattr(pipeline, "model", None), "_embedding", None)

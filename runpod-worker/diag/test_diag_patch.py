@@ -48,7 +48,8 @@ for needle in ("_diag_record_s0(output, annotation)", "_diag_record_probe(", "_d
 # 4) execute only the helpers (and plain constants) in an isolated namespace
 WANTED_FUNCS = REQUIRED - {"_separate_speakers", "handler"} | {
     "_as_number", "_effective_settings", "_library_versions", "_capped_rows", "_worker_identity",
-    "_job_pyannote_mode",
+    "_job_pyannote_mode", "_bounded_number", "_bounded_count", "_parse_pyannote_raw",
+    "_public_raw_controls",
 }
 body = []
 for node in TREE.body:
@@ -56,7 +57,7 @@ for node in TREE.body:
         body.append(node)
     elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
         name = node.targets[0].id
-        if name.startswith(("DIAR_", "DIARIZATION_", "DIAG_")) or name in {
+        if name.startswith(("DIAR_", "DIARIZATION_", "DIAG_", "_RAW_")) or name in {
             "ROWS_CAP", "WHISPER_MODEL", "SAMPLE_RATE", "_diag_extra", "_diag_runs", "IMAGE_TAG",
         }:
             body.append(node)
@@ -139,9 +140,40 @@ assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_bin
 assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
 assert debug["worker_code"]["assignment"] == "three_pass_word"
 assert debug["worker_code"]["pyannote_mode"] == "programmed"
-assert debug["worker_code"]["diag_patch"] >= 12
+assert debug["worker_code"]["diag_patch"] >= 13
 raw_identity = ns["_worker_identity"]("raw")
 assert raw_identity["assignment"] == "pyannote_raw" and raw_identity["pyannote_mode"] == "raw"
+assert "pyannote_raw" not in raw_identity
+raw_part = sep_src.split('if mode == "raw":', 1)[1].split('return annotation, "pyannote_raw"', 1)[0]
+assert "_apply_pyannote_raw" in raw_part
+assert "_prepare_diarization_audio" not in raw_part
+assert "_configure_pipeline" not in raw_part
+assert "_split_within_speakers" not in raw_part
+assert "raw_controls" in handler_src and "pyannote_raw" in handler_src
+stock = ns["_parse_pyannote_raw"](None)
+assert stock["stock"] is True and stock["threshold"] is None and stock["num_speakers"] is None
+assert ns["_parse_pyannote_raw"]({})["stock"] is True
+clamped = ns["_parse_pyannote_raw"]({
+    "threshold": 0.1, "Fa": 9, "Fb": 0, "min_duration_off": 3,
+    "prompt": "split the speakers", "min_active_ratio": 0.02,
+})
+assert clamped["threshold"] == 0.5 and clamped["Fa"] == 0.5
+assert clamped["Fb"] == 0.01 and clamped["min_duration_off"] == 1.0
+assert clamped["stock"] is False and "prompt" not in clamped and "min_active_ratio" not in clamped
+exact = ns["_parse_pyannote_raw"]({
+    "num_speakers": 3, "min_speakers": 1, "max_speakers": 8, "threshold": 0.55,
+})
+assert exact["num_speakers"] == 3 and exact["min_speakers"] is None and exact["max_speakers"] is None
+assert exact["threshold"] == 0.55
+swapped = ns["_parse_pyannote_raw"]({"min_speakers": 5, "max_speakers": 2})
+assert swapped["min_speakers"] == 2 and swapped["max_speakers"] == 5 and swapped["min_max_swapped"] is True
+assert ns["_parse_pyannote_raw"]({"threshold": "nope", "num_speakers": True})["stock"] is True
+assert ns["_parse_pyannote_raw"]({"num_speakers": 21})["num_speakers"] == 20
+assert ns["_parse_pyannote_raw"]({"num_speakers": 0})["stock"] is True
+assert ns["_public_raw_controls"](stock) == {"stock": True}
+assert ns["_public_raw_controls"](exact)["threshold"] == 0.55
+assert ns["_public_raw_controls"](exact)["num_speakers"] == 3
+assert "min_speakers" not in ns["_public_raw_controls"](exact)
 json.dumps(ns["_clean"](fields))  # must serialise (NaN/inf/numpy handled by _clean)
 
 # rescue codes
