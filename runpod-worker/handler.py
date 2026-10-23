@@ -375,8 +375,49 @@ def _install_active_ratio(clustering, ratio):
         return kept
 
     wrapped._audvid_wrapped = True
+    wrapped._audvid_original = original
     wrapped._audvid_ratio = float(ratio)
     clustering.filter_embeddings = wrapped
+
+
+_pyannote_stock = None
+
+
+def _snapshot_pyannote_stock(model):
+    """Remember the pipeline's own parameters before any job changes them."""
+    global _pyannote_stock
+    if _pyannote_stock is not None:
+        return
+    clustering = getattr(model, "clustering", None)
+    segmentation = getattr(model, "segmentation", None)
+    current = getattr(clustering, "filter_embeddings", None)
+    if getattr(current, "_audvid_wrapped", False):
+        current = getattr(current, "_audvid_original", None)
+    _pyannote_stock = {
+        "threshold": getattr(clustering, "threshold", None),
+        "Fa": getattr(clustering, "Fa", None),
+        "Fb": getattr(clustering, "Fb", None),
+        "min_duration_off": getattr(segmentation, "min_duration_off", None),
+        "min_duration_on": getattr(segmentation, "min_duration_on", None),
+        "filter_embeddings": current,
+    }
+
+
+def _restore_pyannote_stock(model):
+    """Put back the parameters Pyannote loaded with. A later programmed job sets them again."""
+    _snapshot_pyannote_stock(model)
+    stock = _pyannote_stock or {}
+    clustering = getattr(model, "clustering", None)
+    segmentation = getattr(model, "segmentation", None)
+    for name in ("threshold", "Fa", "Fb"):
+        if stock.get(name) is not None:
+            _assign_param(clustering, name, stock[name])
+    for name in ("min_duration_off", "min_duration_on"):
+        if stock.get(name) is not None:
+            _assign_param(segmentation, name, stock[name])
+    original = stock.get("filter_embeddings")
+    if clustering is not None and original is not None:
+        clustering.filter_embeddings = original
 
 
 def _configure_pipeline(model):
@@ -925,10 +966,37 @@ def _split_within_speakers(model, audio, annotation):
     return _annotation_from_named(tracks), splits, notes
 
 
-def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers):
+def _separate_speakers(pipeline, audio, num_speakers, min_speakers, max_speakers, mode="programmed"):
     model = pipeline.model
     _diag_runs.clear()
     _diag_extra.clear()
+    if mode not in ("raw", "programmed"):
+        mode = "programmed"
+    _snapshot_pyannote_stock(model)
+    _diag_note("job", pyannote_mode=mode)
+    if mode == "raw":
+        _restore_pyannote_stock(model)
+        _diag_note("bounds", requested={"num_speakers": None, "min_speakers": None, "max_speakers": None})
+        _diag_note("bounds", effective={"num_speakers": None, "min_speakers": None, "max_speakers": None})
+        _diag_record_audio(audio, audio)
+        _diag_record_settings(model)
+        output = _call_pipeline(model, audio, None, None, None)
+        annotation = _best_annotation(output)
+        found = _label_count(annotation)
+        _diag_record_s0(output, annotation)
+        _diag_note("within_split", status="skipped", reason="pyannote_raw")
+        _diag_note(
+            "trigger",
+            collapsed=False,
+            short=False,
+            probe_ran=False,
+            within_split=False,
+            s0_labels=found,
+            pyannote_mode="raw",
+        )
+        _diag_note("final", rescue="pyannote_raw", s0_labels=found, final_labels=found)
+        print(f"[diarize] pyannote raw speakers={found}", flush=True)
+        return annotation, "pyannote_raw"
     _diag_note("bounds", requested={"num_speakers": num_speakers, "min_speakers": min_speakers, "max_speakers": max_speakers})
     num_speakers, min_speakers, max_speakers = _speaker_bounds(num_speakers, min_speakers, max_speakers)
     _diag_note("bounds", effective={"num_speakers": num_speakers, "min_speakers": min_speakers, "max_speakers": max_speakers})
@@ -1032,19 +1100,26 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 11
+DIAG_PATCH_VERSION = 12
 IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
 
 
-def _worker_identity():
+def _job_pyannote_mode():
+    mode = (_diag_extra.get("job") or {}).get("pyannote_mode")
+    return mode if mode in ("raw", "programmed") else "programmed"
+
+
+def _worker_identity(pyannote_mode="programmed"):
     """Identity of the image that is executing this job. Baked in at build time."""
+    mode = pyannote_mode if pyannote_mode in ("raw", "programmed") else "programmed"
     return {
         "image_tag": IMAGE_TAG or None,
         "base_commit": DIAG_BASE_COMMIT,
         "diag_patch": DIAG_PATCH_VERSION,
-        "assignment": "three_pass_word",
+        "assignment": "pyannote_raw" if mode == "raw" else "three_pass_word",
+        "pyannote_mode": mode,
         "runpod_pod_id": os.environ.get("RUNPOD_POD_ID") or None,
         "runpod_endpoint_id": os.environ.get("RUNPOD_ENDPOINT_ID") or None,
         "runpod_dc_id": os.environ.get("RUNPOD_DC_ID") or None,
@@ -1340,7 +1415,7 @@ def _build_diarization_debug(rescue, speakers, segments, rows, job_id=None, dura
     return {
         "schema_version": 1,
         "status": "ok",
-        "worker_code": _worker_identity(),
+        "worker_code": _worker_identity(_job_pyannote_mode()),
         "computed_in_this_job": True,
         "job_fingerprint_sha256_12": fingerprint,
         "audio_duration_s": duration_s,
@@ -1511,6 +1586,34 @@ def _collect_speakers(segments, rows):
             if word.get("speaker"):
                 found.add(str(word["speaker"]))
     return sorted(found)
+
+
+def _label_words_by_pyannote_overlap(segments, rows):
+    """Give each word the Pyannote label of the span that covers the most of it.
+
+    Pyannote does not see transcript words. This only copies its span label onto
+    a word when the two times overlap. No minimum overlap, no rival gate, and no
+    copy from the previous word.
+    """
+    for segment in segments:
+        for word in segment.get("words") or []:
+            word.pop("speaker", None)
+            if word.get("start") is None:
+                continue
+            start = float(word["start"])
+            end = float(word["end"]) if word.get("end") is not None else start
+            if end < start:
+                end = start
+            best = None
+            best_overlap = 0.0
+            for row in rows:
+                overlap = min(end, float(row["end"])) - max(start, float(row["start"]))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best = row
+            if best is not None and best_overlap > 0:
+                word["speaker"] = str(best["speaker"])
+    return segments
 
 
 def _bind_words(segments, rows):
@@ -1944,9 +2047,14 @@ def _retie_words_by_voice(embedding_model, audio, segments):
     }
 
 
-def _assign_speakers(result, annotation, audio=None, embedding_model=None):
+def _assign_speakers(result, annotation, audio=None, embedding_model=None, mode="programmed"):
     rows = _rows_from_annotation(annotation)
     if not rows or not result.get("segments"):
+        return result, rows
+    if mode == "raw":
+        segments = _label_words_by_pyannote_overlap(result.get("segments") or [], rows)
+        _diag_note("word_voice", status="skipped", reason="pyannote_raw", assignment="pyannote_span")
+        result["segments"] = _split_segments_by_speaker(segments)
         return result, rows
     segments = _bind_words(result.get("segments") or [], rows)
     if audio is not None and embedding_model is not None:
@@ -1979,6 +2087,9 @@ def handler(job):
     batch_size = int(job_input.get("batch_size") or DEFAULT_BATCH_SIZE)
     align_output = bool(job_input.get("align_output", True))
     diarization = bool(job_input.get("diarization", False))
+    pyannote_mode = str(job_input.get("pyannote_mode") or "programmed").strip().lower()
+    if pyannote_mode not in ("raw", "programmed"):
+        pyannote_mode = "programmed"
     hf_token = job_input.get("huggingface_access_token") or os.environ.get("HF_TOKEN")
     if diarization and not hf_token:
         return {"error": "huggingface_access_token (or HF_TOKEN env) is required for diarization"}
@@ -2028,10 +2139,13 @@ def handler(job):
                 num_speakers=_optional_int(job_input, "num_speakers"),
                 min_speakers=_optional_int(job_input, "min_speakers"),
                 max_speakers=_optional_int(job_input, "max_speakers"),
+                mode=pyannote_mode,
             )
-            prepared = _prepare_diarization_audio(audio)
+            prepared = audio if pyannote_mode == "raw" else _prepare_diarization_audio(audio)
             embedding_model = getattr(getattr(pipeline, "model", None), "_embedding", None)
-            result, diarization_rows = _assign_speakers(result, annotation, prepared, embedding_model)
+            result, diarization_rows = _assign_speakers(
+                result, annotation, prepared, embedding_model, mode=pyannote_mode
+            )
             speakers = _collect_speakers(result.get("segments") or [], diarization_rows)
             diag_fields = _diag_output_fields(
                 rescue, speakers, result.get("segments") or [], diarization_rows, job.get("id"), duration_s
@@ -2057,7 +2171,7 @@ def handler(job):
                 "duration_s": duration_s,
                 "timings": timings,
                 "model": WHISPER_MODEL,
-                "worker": _worker_identity(),
+                "worker": _worker_identity(pyannote_mode),
                 **diag_fields,
             }
         )

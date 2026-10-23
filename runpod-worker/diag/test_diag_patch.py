@@ -48,6 +48,7 @@ for needle in ("_diag_record_s0(output, annotation)", "_diag_record_probe(", "_d
 # 4) execute only the helpers (and plain constants) in an isolated namespace
 WANTED_FUNCS = REQUIRED - {"_separate_speakers", "handler"} | {
     "_as_number", "_effective_settings", "_library_versions", "_capped_rows", "_worker_identity",
+    "_job_pyannote_mode",
 }
 body = []
 for node in TREE.body:
@@ -137,7 +138,10 @@ assert debug["job_fingerprint_sha256_12"] == hashlib.sha256(b"job-1").hexdigest(
 assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_binding"]["tagged_final"] == 2
 assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
 assert debug["worker_code"]["assignment"] == "three_pass_word"
-assert debug["worker_code"]["diag_patch"] >= 11
+assert debug["worker_code"]["pyannote_mode"] == "programmed"
+assert debug["worker_code"]["diag_patch"] >= 12
+raw_identity = ns["_worker_identity"]("raw")
+assert raw_identity["assignment"] == "pyannote_raw" and raw_identity["pyannote_mode"] == "raw"
 json.dumps(ns["_clean"](fields))  # must serialise (NaN/inf/numpy handled by _clean)
 
 # rescue codes
