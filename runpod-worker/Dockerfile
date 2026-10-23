@@ -62,6 +62,10 @@ COPY download_models.py /opt/worker/download_models.py
 RUN python /opt/worker/download_models.py --whisper "${WHISPER_MODEL}" --align ${ALIGN_LANGUAGES}
 
 COPY handler.py /opt/worker/handler.py
+
+ARG AUDVID_IMAGE_TAG=
+ENV AUDVID_IMAGE_TAG=${AUDVID_IMAGE_TAG}
+
 WORKDIR /opt/worker
 
 CMD ["python", "-u", "handler.py"]

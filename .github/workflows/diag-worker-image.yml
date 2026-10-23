@@ -104,6 +104,8 @@ jobs:
           push: true
           provenance: false
           tags: ${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            AUDVID_IMAGE_TAG=${{ steps.meta.outputs.repo }}:${{ steps.meta.outputs.tag }}
 
       - name: Verify the pushed image contains exactly this handler.py and :latest is untouched
         env:

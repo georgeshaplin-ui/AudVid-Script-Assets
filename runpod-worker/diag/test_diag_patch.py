@@ -46,7 +46,9 @@ for needle in ("_diag_record_s0(output, annotation)", "_diag_record_probe(", "_d
     assert needle in sep_src, f"expected diagnostic call not found: {needle}"
 
 # 4) execute only the helpers (and plain constants) in an isolated namespace
-WANTED_FUNCS = REQUIRED - {"_separate_speakers", "handler"} | {"_as_number", "_effective_settings", "_library_versions", "_capped_rows"}
+WANTED_FUNCS = REQUIRED - {"_separate_speakers", "handler"} | {
+    "_as_number", "_effective_settings", "_library_versions", "_capped_rows", "_worker_identity",
+}
 body = []
 for node in TREE.body:
     if isinstance(node, ast.FunctionDef) and node.name in WANTED_FUNCS:
@@ -54,12 +56,13 @@ for node in TREE.body:
     elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
         name = node.targets[0].id
         if name.startswith(("DIAR_", "DIARIZATION_", "DIAG_")) or name in {
-            "ROWS_CAP", "WHISPER_MODEL", "SAMPLE_RATE", "_diag_extra", "_diag_runs",
+            "ROWS_CAP", "WHISPER_MODEL", "SAMPLE_RATE", "_diag_extra", "_diag_runs", "IMAGE_TAG",
         }:
             body.append(node)
 # DEVICE / COMPUTE_TYPE are derived from torch in handler.py; fixed here (no torch needed).
 ns = {
     "np": np, "math": math, "hashlib": hashlib, "importlib": importlib, "os": os,
+    "socket": __import__("socket"),
     "DEVICE": "cpu", "COMPUTE_TYPE": "int8",
 }
 exec(compile(ast.Module(body=body, type_ignores=[]), SRC, "exec"), ns)
@@ -132,7 +135,8 @@ assert debug["replacement"]["reason_code"] == "pipeline_rows_kept_probe_not_trig
 assert debug["replacement"]["replaced_pyannote_rows"] is False
 assert debug["job_fingerprint_sha256_12"] == hashlib.sha256(b"job-1").hexdigest()[:12]
 assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_binding"]["tagged_final"] == 2
-assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 1
+assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
+assert debug["worker_code"]["assignment"] == "embedding_cluster"
 json.dumps(ns["_clean"](fields))  # must serialise (NaN/inf/numpy handled by _clean)
 
 # rescue codes

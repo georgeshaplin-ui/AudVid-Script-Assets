@@ -406,8 +406,9 @@ def main():
         word(3.6, 3.7, "SPEAKER_00"),
     ]}]
     same_info = module._retie_words_by_voice(MeanEmbedding(), same_audio, same)
-    same_labels = {item["speaker"] for item in same[0]["words"]}
-    if same_labels != {"SPEAKER_00"} or same_info.get("splits"):
+    same_labels = {item.get("speaker") for item in same[0]["words"] if item.get("speaker")}
+    short_word = next(item for item in same[0]["words"] if item["end"] - item["start"] < 0.2)
+    if same_labels != {"SPEAKER_00"} or same_info.get("splits") or short_word.get("speaker"):
         failures.append(f"one voice was split by the word pass: {same_labels} {same_info}")
     extracted_prints = [item for item in (same_info.get("word_prints") or []) if item.get("extracted")]
     missed_prints = [item for item in (same_info.get("word_prints") or []) if not item.get("extracted")]
@@ -478,8 +479,10 @@ def main():
     close_info = module._retie_words_by_voice(CloseVoice(), close_audio, close_words)
     close_early = {item["speaker"] for item in close_words[0]["words"] if item["start"] < 3.0}
     close_late = {item["speaker"] for item in close_words[0]["words"] if item["start"] >= 3.0}
-    if close_info.get("status") != "ran" or close_early == close_late or len(close_early) != 1 or len(close_late) != 1:
-        failures.append(f"sustained nearby voice was swallowed: {close_info} early={close_early} late={close_late}")
+    if close_info.get("status") != "ran" or close_early != {"SPEAKER_00"} or close_late != {"SPEAKER_00"}:
+        failures.append(
+            f"cosine 0.83 is still one voice and was split: {close_info} early={close_early} late={close_late}"
+        )
 
     class BlipVoice:
         def __call__(self, tensor):
@@ -507,12 +510,13 @@ def main():
         word(4.5, 5.0, "SPEAKER_00"),
     ]}]
     blip_info = module._retie_words_by_voice(BlipVoice(), blip_audio, blip_words)
-    blip_labels = [item["speaker"] for item in blip_words[0]["words"]]
-    if len(set(blip_labels)) != 1 or blip_info.get("prints") != 1:
-        failures.append(f"one odd word opened a speaker: {blip_labels} {blip_info}")
+    blip_labels = [item.get("speaker") for item in blip_words[0]["words"]]
+    others = set(blip_labels[:3] + blip_labels[4:])
+    if blip_info.get("status") != "ran" or others != {"SPEAKER_00"} or blip_labels[3] in (None, "", "SPEAKER_00"):
+        failures.append(f"a different word print was not its own speaker: {blip_labels} {blip_info}")
 
-    if module.DIAG_PATCH_VERSION < 9:
-        failures.append(f"three-pass word review is not in diag patch {module.DIAG_PATCH_VERSION}")
+    if module.DIAG_PATCH_VERSION < 10 or module._retie_words_by_voice.__doc__.find("clustering") < 0:
+        failures.append(f"voiceprint-only clustering is not in diag patch {module.DIAG_PATCH_VERSION}")
 
     def alternating_case(second_vector):
         class SplitEmbedding:
@@ -541,20 +545,21 @@ def main():
     far_labels = [item["speaker"] for item in far_segments[0]["words"]]
     if (
         far_labels != ["SPEAKER_00", "SPEAKER_01"] * 3
-        or far_info.get("review_passes") != 3
+        or far_info.get("assignment") != "embedding_cluster"
+        or far_info.get("review_passes") != 1
         or far_info.get("review_unit") != "word"
     ):
         failures.append(f"interleaved different prints were mixed: {far_labels} {far_info}")
     far_again = [{"words": [word(start, end, "SPEAKER_00") for start, end in far_spans]}]
     module._retie_words_by_voice(far_model, far_audio, far_again)
     if [item["speaker"] for item in far_again[0]["words"]] != far_labels:
-        failures.append("the stable shuffle changed labels for the same interleaved audio")
+        failures.append("the same interleaved audio got different labels on the second run")
 
     near_model, near_audio, near_segments, _near_spans = alternating_case([0.83, 0.55776, 0.0])
     near_info = module._retie_words_by_voice(near_model, near_audio, near_segments)
     near_labels = [item["speaker"] for item in near_segments[0]["words"]]
-    if near_info.get("status") != "ran" or near_labels != ["SPEAKER_00", "SPEAKER_01"] * 3:
-        failures.append(f"interleaved nearby prints were mixed: {near_labels} {near_info}")
+    if near_info.get("status") != "ran" or set(near_labels) != {"SPEAKER_00"}:
+        failures.append(f"cosine 0.83 variation was split: {near_labels} {near_info}")
 
     same_alt_model, same_alt_audio, same_alt_segments, _same_spans = alternating_case([0.85, 0.526782, 0.0])
     same_alt_info = module._retie_words_by_voice(same_alt_model, same_alt_audio, same_alt_segments)

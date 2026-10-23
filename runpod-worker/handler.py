@@ -4,6 +4,7 @@ import hashlib
 import importlib.metadata
 import math
 import os
+import socket
 import tempfile
 import time
 import traceback
@@ -55,26 +56,13 @@ DIAR_WITHIN_MIN_SPAN_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPAN_S", "
 # separate a real second voice.
 DIAR_WITHIN_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPEAKER_S", "1.0"))
 DIAR_WITHIN_MAX_CLUSTERS = int(os.environ.get("DIARIZATION_WITHIN_MAX_CLUSTERS", "4"))
-# Voice prints are built from whole runs of words, then every word is assigned
-# to the nearest print. A new print needs about a second of speech that is
-# tighter with itself than with any print already known. A single odd word
-# stays with the nearest known print. Nothing here reads the transcript text.
+# Each measured word is embedded from its own audio, then every vector is
+# clustered once. Euclidean 0.75 on unit vectors is cosine similarity 0.72:
+# a shout or a pitch change stays one person, and a different voice does not.
+# A word with no vector stays unlabeled. Pause, neighbor, word count, and
+# walk order do not assign a speaker. The transcript text is not read.
 DIAR_WORD_WINDOW_S = float(os.environ.get("DIARIZATION_WORD_WINDOW_S", "0.50"))
-DIAR_PRINT_CLUSTER_DISTANCE = float(os.environ.get("DIARIZATION_PRINT_CLUSTER_DISTANCE", "0.50"))
-DIAR_PRINT_JOIN = float(os.environ.get("DIARIZATION_PRINT_JOIN", "0.88"))
-DIAR_PRINT_FAR = float(os.environ.get("DIARIZATION_PRINT_FAR", "0.80"))
-DIAR_PRINT_OBVIOUS = float(os.environ.get("DIARIZATION_PRINT_OBVIOUS", "0.55"))
-DIAR_PRINT_BORDER = float(os.environ.get("DIARIZATION_PRINT_BORDER", "0.84"))
-DIAR_PRINT_MARGIN = float(os.environ.get("DIARIZATION_PRINT_MARGIN", "0.12"))
-DIAR_PRINT_SELF = float(os.environ.get("DIARIZATION_PRINT_SELF", "0.92"))
-DIAR_PRINT_MIN_SECONDS = float(os.environ.get("DIARIZATION_PRINT_MIN_SECONDS", "1.0"))
-DIAR_PRINT_MIN_WORDS = int(os.environ.get("DIARIZATION_PRINT_MIN_WORDS", "3"))
-DIAR_WORD_SPLIT_DISTANCE = DIAR_PRINT_CLUSTER_DISTANCE
-DIAR_WORD_SPLIT_MAX_SIMILARITY = DIAR_PRINT_BORDER
-DIAR_WORD_MOVE_MARGIN = DIAR_PRINT_MARGIN
-DIAR_WORD_MIN_MATCH = DIAR_PRINT_JOIN
-DIAR_WORD_MIN_NEW_WORDS = DIAR_PRINT_MIN_WORDS
-DIAR_WORD_MIN_NEW_SECONDS = DIAR_PRINT_MIN_SECONDS
+DIAR_WORD_CLUSTER_DISTANCE = float(os.environ.get("DIARIZATION_WORD_CLUSTER_DISTANCE", "0.75"))
 DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
 DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
 DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
@@ -765,12 +753,11 @@ def _covered_seconds(spans):
 def _fold_short_if_same_voice(spans, labels, matrix, min_seconds, max_similarity):
     """Fold every fragment shorter than min_seconds into the nearest longer voice.
 
-    A third of a second used to become its own speaker and then could not be
-    merged, because the fragment matched itself perfectly. Short replies of a
-    person who already has a real print are restored when words are assigned.
-    max_similarity is unused; it remains so older callers keep the same signature.
+    A fragment shorter than min_seconds is folded into the nearest longer voice
+    only when their embeddings still match. A short window of a different voice
+    is left alone. max_similarity is that cosine ceiling: at or below it, the
+    fragment is a different person.
     """
-    del max_similarity
     labels = np.asarray(labels, dtype=int).copy()
     spans_by_label = {}
     for label, (start, end) in zip(labels, spans):
@@ -789,6 +776,9 @@ def _fold_short_if_same_voice(spans, labels, matrix, min_seconds, max_similarity
         point = matrix[labels == label].mean(axis=0)
         point = point / max(float(np.linalg.norm(point)), 1e-8)
         nearest = max(long, key=lambda item: float(np.dot(point, centroids[item])))
+        # A short window of a different voice stays its own speaker.
+        if float(np.dot(point, centroids[nearest])) <= float(max_similarity):
+            continue
         labels[labels == label] = nearest
     return labels
 
@@ -1041,9 +1031,24 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 9
+DIAG_PATCH_VERSION = 10
+IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
+
+
+def _worker_identity():
+    """Identity of the image that is executing this job. Baked in at build time."""
+    return {
+        "image_tag": IMAGE_TAG or None,
+        "base_commit": DIAG_BASE_COMMIT,
+        "diag_patch": DIAG_PATCH_VERSION,
+        "assignment": "embedding_cluster",
+        "runpod_pod_id": os.environ.get("RUNPOD_POD_ID") or None,
+        "runpod_endpoint_id": os.environ.get("RUNPOD_ENDPOINT_ID") or None,
+        "runpod_dc_id": os.environ.get("RUNPOD_DC_ID") or None,
+        "hostname": socket.gethostname(),
+    }
 
 
 def _diag_note(section, **values):
@@ -1334,7 +1339,7 @@ def _build_diarization_debug(rescue, speakers, segments, rows, job_id=None, dura
     return {
         "schema_version": 1,
         "status": "ok",
-        "worker_code": {"base_commit": DIAG_BASE_COMMIT, "diag_patch": DIAG_PATCH_VERSION},
+        "worker_code": _worker_identity(),
         "computed_in_this_job": True,
         "job_fingerprint_sha256_12": fingerprint,
         "audio_duration_s": duration_s,
@@ -1481,7 +1486,7 @@ def _split_segments_by_speaker(segments):
             split.append(piece)
 
         for word in words:
-            speaker = word.get("speaker") or group_speaker
+            speaker = word.get("speaker") or None
             if group and speaker != group_speaker:
                 flush()
                 group = []
@@ -1510,15 +1515,11 @@ def _collect_speakers(segments, rows):
 def _bind_words(segments, rows):
     """Keep a word with the speaker who started it.
 
-    whisperx's max-overlap rule gives the last words of a turn to the next person
-    when the timestamp spills a little past the cut. A word moves to the other
-    speaker only when that speaker clearly owns most of the word. A word sitting
-    in a short gap stays with the speaker who just finished, not the one about to start.
+    A word is labeled only by the embedding span that overlaps it. A gap does
+    not copy the previous speaker onto a word the span does not cover.
     """
     if not rows:
         return segments
-    previous_speaker = None
-    previous_end = None
     for segment in segments:
         for word in segment.get("words") or []:
             if word.get("start") is None:
@@ -1556,20 +1557,8 @@ def _bind_words(segments, rows):
                 best_overlap, best_row = max(overlaps, key=lambda item: item[0])
                 if best_overlap >= 0.35 * duration:
                     chosen = best_row["speaker"]
-            if (
-                chosen is None
-                and previous_speaker is not None
-                and previous_end is not None
-                and 0.0 <= start - previous_end <= 0.40
-            ):
-                chosen = previous_speaker
             if chosen:
                 word["speaker"] = str(chosen)
-                previous_speaker = str(chosen)
-                previous_end = end
-            elif previous_end is not None and start - previous_end > 0.40:
-                previous_speaker = None
-                previous_end = None
     return segments
 
 
@@ -1730,15 +1719,11 @@ def _word_print_records(words, reliable, matrix, centers, names):
 
 
 def _retie_words_by_voice(embedding_model, audio, segments):
-    """Give every word the nearest sustained voice print.
+    """Label every measured word by one clustering of its own embedding.
 
-    Every measured word is reviewed three times: in time order, in reverse,
-    and in a shuffle fixed by the word times. A word joins a print only when
-    its own vector clears the join gate, and that print's center stays frozen.
-    A new print still has to clear the same sustained-voice gates. The label
-    kept for a word is the one two passes agree on. One odd word stays with
-    the nearest known print. Words too short to measure follow the nearest
-    measured word. The previous label is not evidence.
+    The previous label is not evidence. A word too short or too quiet to embed
+    stays unlabeled. A pause, a neighbor, a word count, or the visit order
+    does not assign a speaker.
     """
     if embedding_model is None or audio is None or len(audio) == 0:
         return {"status": "skipped", "reason": "no_embedding_model"}
@@ -1747,11 +1732,11 @@ def _retie_words_by_voice(embedding_model, audio, segments):
     clips = []
     for segment in segments:
         for word in segment.get("words") or []:
-            if word.get("start") is None or not word.get("speaker"):
+            if word.get("start") is None:
                 continue
             words.append(word)
-            start, end, _duration = _word_duration(word)
-            clip = _word_clip(audio, start, end, DIAR_WORD_WINDOW_S)
+            _start, _end, _duration = _word_duration(word)
+            clip = _word_clip(audio, _start, _end, DIAR_WORD_WINDOW_S)
             if clip is None:
                 continue
             reliable.append(len(words) - 1)
@@ -1763,43 +1748,35 @@ def _retie_words_by_voice(embedding_model, audio, segments):
         return {"status": "skipped", "reason": "embedding_failed", "words": len(reliable)}
     finite = np.all(np.isfinite(embedded), axis=1)
     if not np.all(finite):
-        reliable = [index for index, ok in zip(reliable, finite) if ok]
-        embedded = embedded[finite]
-    if len(reliable) < 4:
+        kept_reliable = []
+        kept_rows = []
+        for index, ok, row in zip(reliable, finite, embedded):
+            if ok:
+                kept_reliable.append(index)
+                kept_rows.append(row)
+            else:
+                words[index].pop("speaker", None)
+        reliable = kept_reliable
+        embedded = np.vstack(kept_rows) if kept_rows else None
+    if embedded is None or len(reliable) < 4:
         return {"status": "skipped", "reason": "too_few_words", "words": len(reliable)}
-    original = [str(words[index].get("speaker")) for index in reliable]
+    original = [str(words[index].get("speaker") or "") for index in reliable]
     matrix = _normalize_rows(embedded)
-    centers, choice = _review_each_word(matrix, words, reliable)
-    if not centers:
-        return {"status": "skipped", "reason": "no_print", "words": len(reliable)}
-    # Pull a single short word back when both neighbours are the same print
-    # and this word is not a clear match to somebody else.
-    order_index = sorted(range(len(reliable)), key=lambda index: float(words[reliable[index]]["start"]))
-    position = {index: place for place, index in enumerate(order_index)}
-    for index in order_index:
-        _start, _end, duration = _word_duration(words[reliable[index]])
-        if duration >= 0.55:
+    labels, similarity = _cluster_embeddings(
+        matrix,
+        DIAR_WORD_CLUSTER_DISTANCE,
+        min_clusters=1,
+        max_clusters=min(DIAR_MAX_AUTO_SPEAKERS, int(matrix.shape[0])),
+    )
+    choice = [int(value) for value in labels]
+    centers = []
+    for print_index in range(max(choice) + 1 if choice else 0):
+        block = matrix[np.asarray(choice) == print_index]
+        if len(block) == 0:
+            centers.append(np.zeros(matrix.shape[1], dtype=np.float64))
             continue
-        place = position[index]
-        neighbours = []
-        if place > 0:
-            neighbours.append(order_index[place - 1])
-        if place + 1 < len(order_index):
-            neighbours.append(order_index[place + 1])
-        if len(neighbours) < 2 or choice[neighbours[0]] != choice[neighbours[1]]:
-            continue
-        if choice[neighbours[0]] == choice[index]:
-            continue
-        # Interleaving puts the other voice on both sides. A different print
-        # stays where its own vector put it; only a glitch inside one print moves.
-        if float(np.dot(centers[choice[index]], centers[choice[neighbours[0]]])) < DIAR_PRINT_JOIN:
-            continue
-        mine = float(np.dot(matrix[index], centers[choice[index]]))
-        other = float(np.dot(matrix[index], centers[choice[neighbours[0]]]))
-        if mine >= 0.88 and mine >= other + 0.10:
-            continue
-        if other >= mine - 0.08:
-            choice[index] = choice[neighbours[0]]
+        center = block.mean(axis=0)
+        centers.append(center / max(float(np.linalg.norm(center)), 1e-8))
     first_at = []
     for print_index in range(len(centers)):
         times = [
@@ -1812,319 +1789,34 @@ def _retie_words_by_voice(embedding_model, audio, segments):
     names = {print_index: f"SPEAKER_{place:02d}" for place, print_index in enumerate(ranking)}
     for index, chosen in enumerate(choice):
         words[reliable[index]]["speaker"] = names[chosen]
-    measured = []
-    for index, chosen in enumerate(choice):
-        start, end, _duration = _word_duration(words[reliable[index]])
-        measured.append((start, end, names[chosen]))
-    measured.sort()
     reliable_ids = set(reliable)
     for word_index, word in enumerate(words):
-        if word_index in reliable_ids:
-            continue
-        start, end, _duration = _word_duration(word)
-        previous = None
-        following = None
-        for sample_start, sample_end, name in measured:
-            if sample_end <= start + 0.02:
-                gap = start - sample_end
-                if previous is None or gap < previous[0]:
-                    previous = (gap, name)
-            elif sample_start >= end - 0.02:
-                gap = sample_start - end
-                if following is None or gap < following[0]:
-                    following = (gap, name)
-        if previous is not None and previous[0] <= 0.50:
-            word["speaker"] = previous[1]
-        elif following is not None and following[0] <= 0.30:
-            word["speaker"] = following[1]
-        elif previous is not None and previous[0] <= 0.80:
-            word["speaker"] = previous[1]
+        if word_index not in reliable_ids:
+            word.pop("speaker", None)
     final_names = {str(words[index].get("speaker")) for index in reliable}
     moved = sum(
-        1 for index, name in enumerate(original) if str(words[reliable[index]].get("speaker")) != name
+        1
+        for index, name in enumerate(original)
+        if str(words[reliable[index]].get("speaker") or "") != name
     )
     word_prints, print_centers = _word_print_records(words, reliable, matrix, centers, names)
+    same_voice = 1.0 - (DIAR_WORD_CLUSTER_DISTANCE ** 2) / 2.0
     return {
         "status": "ran",
         "words": len(reliable),
-        "splits": int(max(0, len(final_names) - len(set(original)))),
+        "splits": int(max(0, len(final_names) - len({name for name in original if name}))),
         "moved": int(moved),
         "prints": len(final_names),
-        "match_min_cosine": DIAR_PRINT_JOIN,
-        "new_speaker_max_cosine": DIAR_PRINT_BORDER,
-        "review_passes": 3,
+        "match_min_cosine": round(same_voice, 4),
+        "new_speaker_max_cosine": round(same_voice, 4),
+        "centroid_cosine": round(float(similarity), 4),
+        "review_passes": 1,
         "review_unit": "word",
+        "assignment": "embedding_cluster",
         "embedding_dim": int(matrix.shape[1]),
         "word_prints": word_prints,
         "print_centers": print_centers,
     }
-
-
-def _bisect_reliable(matrix, words, reliable, indexes):
-    """indexes are positions in the reliable matrix, not in words."""
-    if len(indexes) < 6:
-        return None
-    local_words = [words[reliable[index]] for index in indexes]
-    if _indexes_duration(local_words, range(len(local_words))) < 2.2:
-        return None
-    labels = _kmeans_labels(matrix[list(indexes)], 2)
-    sides = {}
-    for index, label in zip(indexes, labels):
-        sides.setdefault(int(label), []).append(index)
-    if len(sides) < 2:
-        return None
-    groups = list(sides.values())
-    if any(len(group) < DIAR_PRINT_MIN_WORDS or _indexes_duration(words, [reliable[i] for i in group]) < DIAR_PRINT_MIN_SECONDS for group in groups):
-        return None
-    centers = [_robust_center(matrix[group]) for group in groups]
-    if float(np.dot(centers[0], centers[1])) > DIAR_PRINT_BORDER:
-        return None
-    for group, center, other in ((groups[0], centers[0], centers[1]), (groups[1], centers[1], centers[0])):
-        own = _mean_cosine(matrix, group, center)
-        away = _mean_cosine(matrix, group, other)
-        if own < DIAR_PRINT_SELF or own - away < DIAR_PRINT_MARGIN:
-            return None
-    return groups
-
-
-def _candidate_groups(matrix, words, reliable, indexes):
-    indexes = [int(index) for index in indexes]
-    if len(indexes) < 2:
-        return []
-    labels, _similarity = _cluster_embeddings(
-        matrix[indexes],
-        DIAR_PRINT_CLUSTER_DISTANCE,
-        min_clusters=1,
-        max_clusters=min(16, len(indexes)),
-    )
-    buckets = {}
-    for label, index in zip(_compact_labels(labels), indexes):
-        buckets.setdefault(int(label), []).append(index)
-    groups = []
-    for bucket in buckets.values():
-        split = _bisect_reliable(matrix, words, reliable, bucket)
-        groups.extend(split if split else [list(bucket)])
-    return groups
-
-
-def _nearest_open_print(prints, center):
-    if not prints:
-        return None, -1.0
-    scores = [float(np.dot(center, item)) for item in prints]
-    best = int(np.argmax(scores))
-    return best, scores[best]
-
-
-def _one_voice_run(words, reliable, indexes):
-    spans = sorted(_word_duration(words[reliable[index]])[:2] for index in indexes)
-    for (_start, end), (nxt, _end) in zip(spans, spans[1:]):
-        if nxt - end > 0.60:
-            return False
-    return True
-
-
-def _classify_word_group(matrix, words, reliable, group, prints):
-    """Open, join, or leave a pool of still-unmatched words. Centers stay frozen."""
-    if len(group) < 2:
-        return "skip", None
-    duration = _indexes_duration(words, [reliable[index] for index in group])
-    if duration < 0.70:
-        return "skip", None
-    center = _robust_center(matrix[group])
-    own = _mean_cosine(matrix, group, center)
-    host, score = _nearest_open_print(prints, center)
-    if host is None:
-        return "open", center
-    if score >= DIAR_PRINT_JOIN:
-        return "join", host
-    margin = own - _mean_cosine(matrix, group, prints[host])
-    # Two turns of a new voice may have a pause between them.
-    # Two scattered blips under a second do not.
-    unmistakable = score <= DIAR_PRINT_OBVIOUS and len(group) >= 2 and (
-        (_one_voice_run(words, reliable, group) and duration + 1e-3 >= 0.80)
-        or duration + 1e-3 >= 1.0
-    )
-    clear = (
-        score <= DIAR_PRINT_FAR
-        and duration + 1e-3 >= DIAR_PRINT_MIN_SECONDS
-        and len(group) >= DIAR_PRINT_MIN_WORDS
-    )
-    border = (
-        score <= DIAR_PRINT_BORDER
-        and margin >= DIAR_PRINT_MARGIN
-        and own >= DIAR_PRINT_SELF
-        and duration + 1e-3 >= 1.2
-        and len(group) >= DIAR_PRINT_MIN_WORDS
-    )
-    if unmistakable or clear or border:
-        return "open", center
-    return "skip", None
-
-
-def _absorb_unmatched_words(matrix, words, reliable, unmatched, prints, assigned):
-    if len(unmatched) < 2:
-        return
-    groups = _candidate_groups(matrix, words, reliable, list(unmatched))
-    groups.sort(
-        key=lambda group: _indexes_duration(words, [reliable[index] for index in group]),
-        reverse=True,
-    )
-    for group in groups:
-        group = [index for index in group if index in unmatched]
-        action, payload = _classify_word_group(matrix, words, reliable, group, prints)
-        if action == "open":
-            print_index = len(prints)
-            prints.append(np.asarray(payload, dtype=np.float64).copy())
-            for index in group:
-                assigned[index] = print_index
-                unmatched.discard(index)
-        elif action == "join":
-            host = int(payload)
-            for index in group:
-                if float(np.dot(matrix[index], prints[host])) < DIAR_PRINT_JOIN:
-                    continue
-                assigned[index] = host
-                unmatched.discard(index)
-
-
-def _merge_opened_prints(prints, assigned):
-    merged = []
-    remap = {}
-    for index, center in enumerate(prints):
-        host = None
-        for existing_index, existing in enumerate(merged):
-            if float(np.dot(center, existing)) >= 0.90:
-                host = existing_index
-                break
-        if host is None:
-            remap[index] = len(merged)
-            merged.append(np.asarray(center, dtype=np.float64).copy())
-        else:
-            remap[index] = host
-    remapped = {
-        word_index: remap[print_index]
-        for word_index, print_index in assigned.items()
-        if print_index in remap
-    }
-    return merged, remapped
-
-
-def _word_review_orders(words, reliable):
-    """Time order, reverse order, and a shuffle fixed by the word times.
-
-    The shuffle is not drawn again on the next request. The same file keeps
-    the same third pass, so a speaker label does not flicker between runs.
-    """
-    forward = sorted(
-        range(len(reliable)),
-        key=lambda index: (
-            float(words[reliable[index]]["start"]),
-            float(_word_duration(words[reliable[index]])[1]),
-            index,
-        ),
-    )
-    reverse = list(reversed(forward))
-    seed = 0
-    for index in forward:
-        start, _end, duration = _word_duration(words[reliable[index]])
-        seed = (
-            seed * 1000003
-            + int(round(start * 1000.0))
-            + int(round(duration * 1000.0))
-            + 1
-        ) % (2 ** 32)
-    permutation = np.random.RandomState(seed).permutation(len(forward))
-    shuffled = [forward[int(position)] for position in permutation]
-    return (("forward", forward), ("reverse", reverse), ("shuffle", shuffled))
-
-
-def _link_words_in_order(order, matrix, words, reliable):
-    """Walk words one by one. A different print cannot move a center already opened."""
-    prints = []
-    assigned = {}
-    unmatched = set()
-    for index in order:
-        if prints:
-            host, score = _nearest_open_print(prints, matrix[index])
-            if score >= DIAR_PRINT_JOIN:
-                assigned[int(index)] = host
-                continue
-        unmatched.add(int(index))
-        _absorb_unmatched_words(matrix, words, reliable, unmatched, prints, assigned)
-    for index in list(unmatched):
-        if not prints:
-            continue
-        host, _score = _nearest_open_print(prints, matrix[index])
-        assigned[int(index)] = host
-    if not prints:
-        return [], {}
-    return _merge_opened_prints(prints, assigned)
-
-
-def _review_each_word(matrix, words, reliable):
-    """Three word orders. A word keeps the print that two passes agree on."""
-    passes = []
-    for _name, order in _word_review_orders(words, reliable):
-        centers, assigned = _link_words_in_order(order, matrix, words, reliable)
-        if centers:
-            passes.append((centers, assigned))
-    if not passes:
-        return None, None
-    centers = _consensus_print_centers([item[0] for item in passes], DIAR_PRINT_JOIN)
-    if not centers:
-        centers = [np.asarray(center, dtype=np.float64).copy() for center in passes[0][0]]
-    bank = np.vstack(centers)
-    choice = []
-    for index in range(matrix.shape[0]):
-        votes = {}
-        for pass_centers, assigned in passes:
-            chosen = assigned.get(index)
-            if chosen is None or chosen >= len(pass_centers):
-                continue
-            scores = [float(np.dot(pass_centers[chosen], center)) for center in centers]
-            mapped = int(np.argmax(scores))
-            if scores[mapped] < DIAR_PRINT_JOIN:
-                continue
-            votes[mapped] = votes.get(mapped, 0) + 1
-        if votes:
-            winner = max(votes, key=lambda item: (votes[item], -item))
-            if votes[winner] >= 2:
-                choice.append(winner)
-                continue
-        choice.append(int(np.argmax(bank.dot(matrix[index]))))
-    return centers, choice
-
-
-def _consensus_print_centers(pass_centers, match_cosine):
-    """Keep a print when a matching center was opened in at least two passes."""
-    items = []
-    for pass_index, centers in enumerate(pass_centers):
-        for center in centers:
-            items.append((int(pass_index), np.asarray(center, dtype=np.float64)))
-    used = [False] * len(items)
-    kept = []
-    for index, (_pass_index, center) in enumerate(items):
-        if used[index]:
-            continue
-        members = [(items[index][0], center)]
-        used[index] = True
-        for other_index in range(index + 1, len(items)):
-            if used[other_index]:
-                continue
-            other_pass, other = items[other_index]
-            if float(np.dot(center, other)) < match_cosine:
-                continue
-            members.append((other_pass, other))
-            used[other_index] = True
-        passes = {item_pass for item_pass, _item_center in members}
-        if len(passes) < 2:
-            continue
-        mean = np.vstack([item_center for _item_pass, item_center in members]).mean(axis=0)
-        norm = float(np.linalg.norm(mean))
-        if norm < 1e-8:
-            continue
-        kept.append(mean / norm)
-    return kept
 
 
 def _assign_speakers(result, annotation, audio=None, embedding_model=None):
@@ -2240,6 +1932,7 @@ def handler(job):
                 "duration_s": duration_s,
                 "timings": timings,
                 "model": WHISPER_MODEL,
+                "worker": _worker_identity(),
                 **diag_fields,
             }
         )
