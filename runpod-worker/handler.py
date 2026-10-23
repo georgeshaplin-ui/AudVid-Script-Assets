@@ -176,7 +176,10 @@ def _transcribe(audio, batch_size, language, task):
     if task != "transcribe":
         result = ASR_MODEL.transcribe(audio, batch_size=batch_size, language=language, task=task)
         return result, WHISPER_MODEL
-    detected = language or ASR_MODEL.detect_language(audio)
+    detected = language
+    if not detected:
+        detect = getattr(ASR_MODEL, "detect_language", None)
+        detected = detect(audio) if detect is not None else None
     if detected != "ar":
         result = ASR_MODEL.transcribe(audio, batch_size=batch_size, language=detected, task=task)
         return result, WHISPER_MODEL

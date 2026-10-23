@@ -101,6 +101,9 @@ def install_stubs(audio):
         return result
 
     class ASR:
+        def detect_language(self, audio):
+            return "en"
+
         def transcribe(self, audio, batch_size=16, language=None, task="transcribe"):
             words = copy.deepcopy(WORDS["items"])
             end = words[-1]["end"] if words else 0.0
