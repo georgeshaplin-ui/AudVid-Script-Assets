@@ -21,6 +21,16 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_TYPE = os.environ.get("COMPUTE_TYPE", "float16" if DEVICE == "cuda" else "int8")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 WHISPER_MODEL_PATH = os.path.join(os.environ.get("WHISPER_MODEL_DIR", "/models/whisper"), WHISPER_MODEL)
+# large-v3 writes Arabic the way its training text was written, which is mostly
+# formal Arabic or one common dialect. This fine-tune is the same architecture,
+# balanced across Gulf, Egyptian, Levantine, Iraqi, Yemeni, Sudanese and Maghrebi
+# speech, and it is used only when the file itself is Arabic. No prompt is sent:
+# a prompt written in one dialect would pull every speaker toward that dialect.
+ARABIC_DIALECT_REPO = "oddadmix/whisper-large-v3-arabic-dialectal-v2"
+ARABIC_DIALECT_DIR = os.environ.get(
+    "ARABIC_DIALECT_MODEL_DIR",
+    os.path.join(os.environ.get("WHISPER_MODEL_DIR", "/models/whisper"), "ar-dialect"),
+)
 DIARIZATION_MODEL = os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
 DEFAULT_BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_MB", "500")) * 1024 * 1024
@@ -86,6 +96,7 @@ print(f"[init] ASR ready in {time.time() - _t0:.1f}s", flush=True)
 _align_models = {}
 _diarize_pipeline = None
 _nemo_bundle = None
+_arabic_asr = None
 NEMO_DIARIZATION_MODEL = "nvidia/Nemotron-3-Diarization"
 
 
@@ -122,6 +133,60 @@ def _release_diarizer(which):
     gc.collect()
     if DEVICE == "cuda":
         torch.cuda.empty_cache()
+
+
+def _release_arabic_asr():
+    """Drop the dialect model before alignment and diarization load their own weights."""
+    global _arabic_asr
+    if _arabic_asr is None:
+        return
+    _arabic_asr = None
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _get_arabic_asr():
+    """Load the baked dialect model. It is not downloaded during the job."""
+    global _arabic_asr
+    if _arabic_asr is None:
+        if not os.path.isfile(os.path.join(ARABIC_DIALECT_DIR, "model.bin")):
+            raise RuntimeError(f"arabic dialect model is missing from the image: {ARABIC_DIALECT_DIR}")
+        t0 = time.time()
+        _arabic_asr = whisperx.load_model(
+            ARABIC_DIALECT_DIR,
+            DEVICE,
+            compute_type="int8_float16" if DEVICE == "cuda" else "int8",
+            vad_model=ASR_MODEL.vad_model,
+            language="ar",
+            task="transcribe",
+        )
+        print(f"[asr] arabic dialect model ready in {time.time() - t0:.1f}s", flush=True)
+    return _arabic_asr
+
+
+def _transcribe(audio, batch_size, language, task):
+    """Return the transcript and the model name that wrote it.
+
+    Non-Arabic speech stays on large-v3. Arabic speech is rewritten by that
+    model into formal Arabic or into another dialect, so it is decoded by the
+    dialect fine-tune instead. The fine-tune is not steered with a sample of
+    any one dialect.
+    """
+    if task != "transcribe":
+        result = ASR_MODEL.transcribe(audio, batch_size=batch_size, language=language, task=task)
+        return result, WHISPER_MODEL
+    detected = language or ASR_MODEL.detect_language(audio)
+    if detected != "ar":
+        result = ASR_MODEL.transcribe(audio, batch_size=batch_size, language=detected, task=task)
+        return result, WHISPER_MODEL
+    # Free the diarizer before the second speech model is resident. It is loaded
+    # again after the words are written, with the same settings as this job.
+    _release_diarizer("pyannote")
+    _release_diarizer("nemo")
+    print(f"[asr] language=ar model={ARABIC_DIALECT_REPO}", flush=True)
+    result = _get_arabic_asr().transcribe(audio, batch_size=batch_size, language="ar", task="transcribe")
+    return result, ARABIC_DIALECT_REPO
 
 
 def _nemo_speaker_label(value):
@@ -1346,7 +1411,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 14
+DIAG_PATCH_VERSION = 15
 IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
@@ -2366,8 +2431,12 @@ def handler(job):
         duration_s = round(len(audio) / SAMPLE_RATE, 2)
 
         t = time.time()
-        result = ASR_MODEL.transcribe(audio, batch_size=batch_size, language=language, task=task)
+        try:
+            result, asr_name = _transcribe(audio, batch_size, language, task)
+        finally:
+            _release_arabic_asr()
         timings["transcribe_s"] = round(time.time() - t, 2)
+        timings["asr_model"] = asr_name
         detected_language = result.get("language")
 
         if align_output and result["segments"] and task == "transcribe":
@@ -2453,7 +2522,7 @@ def handler(job):
                 "exclusive_diarization": diarization_rows,
                 "duration_s": duration_s,
                 "timings": timings,
-                "model": WHISPER_MODEL,
+                "model": asr_name,
                 "worker": _worker_identity(pyannote_mode),
                 **diag_fields,
             }

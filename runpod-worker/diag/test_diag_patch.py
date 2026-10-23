@@ -140,7 +140,7 @@ assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_bin
 assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
 assert debug["worker_code"]["assignment"] == "three_pass_word"
 assert debug["worker_code"]["pyannote_mode"] == "programmed"
-assert debug["worker_code"]["diag_patch"] >= 14
+assert debug["worker_code"]["diag_patch"] >= 15
 raw_identity = ns["_worker_identity"]("raw")
 assert raw_identity["assignment"] == "pyannote_raw" and raw_identity["pyannote_mode"] == "raw"
 assert "pyannote_raw" not in raw_identity
@@ -191,6 +191,15 @@ assert ns["_public_raw_controls"](stock) == {"stock": True}
 assert ns["_public_raw_controls"](exact)["threshold"] == 0.55
 assert ns["_public_raw_controls"](exact)["num_speakers"] == 3
 assert "min_speakers" not in ns["_public_raw_controls"](exact)
+transcribe_src = ast.get_source_segment(TEXT, FUNCS["_transcribe"])
+assert "oddadmix/whisper-large-v3-arabic-dialectal-v2" in TEXT
+assert "initial_prompt" not in transcribe_src
+assert 'task != "transcribe"' in transcribe_src
+assert 'detected != "ar"' in transcribe_src
+assert "_get_arabic_asr()" in transcribe_src
+assert "ASR_MODEL.transcribe" in transcribe_src
+assert "_transcribe(" in handler_src
+assert handler_src.index("_release_arabic_asr()") < handler_src.index('if pyannote_mode == "nemo":')
 json.dumps(ns["_clean"](fields))  # must serialise (NaN/inf/numpy handled by _clean)
 
 # rescue codes
