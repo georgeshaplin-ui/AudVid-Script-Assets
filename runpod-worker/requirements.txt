@@ -1,7 +1,13 @@
 # torch / torchaudio / torchvision are installed separately from the cu128 index (see Dockerfile).
-whisperx==3.8.6
+# whisperx==3.8.6 is installed with --no-deps in the Dockerfile. Its own metadata
+# requires huggingface-hub<1, and transformers 5.20.2 requires huggingface-hub>=1.31.
 pyannote.audio==4.0.7
 faster-whisper==1.2.1
 ctranslate2==4.8.3
-huggingface-hub>=0.28.1,<1.0.0
+nltk>=3.9.1
+pandas>=2.2.3
+omegaconf>=2.3.0
+torchcodec>=0.7.0,<0.8.0
+huggingface-hub>=1.31.0,<3.0.0
+transformers==5.20.2
 runpod==1.12.0

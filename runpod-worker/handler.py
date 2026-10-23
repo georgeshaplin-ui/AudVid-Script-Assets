@@ -85,6 +85,8 @@ print(f"[init] ASR ready in {time.time() - _t0:.1f}s", flush=True)
 
 _align_models = {}
 _diarize_pipeline = None
+_nemo_bundle = None
+NEMO_DIARIZATION_MODEL = "nvidia/Nemotron-3-Diarization"
 
 
 def _get_align_model(language):
@@ -102,6 +104,120 @@ def _get_diarize_pipeline(token):
         )
         print(f"[diarize] pipeline ready in {time.time() - t0:.1f}s", flush=True)
     return _diarize_pipeline
+
+
+def _release_diarizer(which):
+    """Drop the other diarizer before a job so both models are not resident together."""
+    global _diarize_pipeline, _nemo_bundle
+    released = False
+    if which == "pyannote" and _diarize_pipeline is not None:
+        _diarize_pipeline = None
+        released = True
+    if which == "nemo" and _nemo_bundle is not None:
+        _nemo_bundle = None
+        released = True
+    if not released:
+        return
+    import gc
+    gc.collect()
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _nemo_speaker_label(value):
+    text = str(value).strip()
+    if text.lower().startswith("speaker_"):
+        text = text.split("_", 1)[-1]
+    try:
+        return f"SPEAKER_{int(float(text)):02d}"
+    except (TypeError, ValueError):
+        return f"SPEAKER_{text}" if text else "SPEAKER_00"
+
+
+def _rows_from_nemo_segments(segments):
+    """Keep the spans Nemotron returned. A span with no positive duration is dropped."""
+    rows = []
+    for segment in segments or []:
+        start = end = speaker = None
+        if isinstance(segment, dict):
+            start = segment.get("Start", segment.get("start"))
+            end = segment.get("End", segment.get("end"))
+            speaker = segment.get("Speaker", segment.get("speaker"))
+        elif isinstance(segment, str):
+            parts = segment.split()
+            if len(parts) >= 3:
+                start, end, speaker = parts[0], parts[1], parts[2]
+        elif isinstance(segment, (list, tuple)) and len(segment) >= 3:
+            start, end, speaker = segment[0], segment[1], segment[2]
+        if start is None or end is None or speaker is None:
+            continue
+        try:
+            start_s = float(start)
+            end_s = float(end)
+        except (TypeError, ValueError):
+            continue
+        if end_s <= start_s:
+            continue
+        rows.append({
+            "start": round(start_s, 3),
+            "end": round(end_s, 3),
+            "speaker": _nemo_speaker_label(speaker),
+        })
+    return rows
+
+
+def _get_nemo_diarizer(token):
+    global _nemo_bundle
+    if _nemo_bundle is not None:
+        return _nemo_bundle
+    from transformers import AutoModelForAudioFrameClassification, AutoProcessor
+    kwargs = {}
+    if DIARIZATION_CACHE:
+        kwargs["cache_dir"] = DIARIZATION_CACHE
+    if token:
+        kwargs["token"] = token
+    t0 = time.time()
+    processor = AutoProcessor.from_pretrained(NEMO_DIARIZATION_MODEL, **kwargs)
+    model = AutoModelForAudioFrameClassification.from_pretrained(NEMO_DIARIZATION_MODEL, **kwargs)
+    model.to(DEVICE)
+    model.eval()
+    print(f"[diarize] nemo ready in {time.time() - t0:.1f}s", flush=True)
+    _nemo_bundle = (model, processor)
+    return _nemo_bundle
+
+
+def _nemo_diarize(audio, token):
+    """Official offline Nemotron 3 call. Defaults stay as published; no streaming cache."""
+    model, processor = _get_nemo_diarizer(token)
+    config = getattr(model, "config", None)
+    _diag_note(
+        "nemo",
+        model=NEMO_DIARIZATION_MODEL,
+        profile="offline",
+        chunk_length=getattr(config, "chunk_length", None),
+        chunk_right_context=getattr(config, "chunk_right_context", None),
+        fifo_length=getattr(config, "fifo_length", None),
+    )
+    waveform = np.asarray(audio, dtype=np.float32).reshape(-1)
+    rate = SAMPLE_RATE
+    extractor = getattr(processor, "feature_extractor", None)
+    if extractor is not None and getattr(extractor, "sampling_rate", None):
+        rate = int(extractor.sampling_rate)
+    inputs = processor(waveform, sampling_rate=rate)
+    inputs = inputs.to(model.device)
+    model_dtype = getattr(model, "dtype", None)
+    if model_dtype is not None:
+        for key in list(inputs.keys()):
+            if key == "attention_mask":
+                continue
+            value = inputs[key]
+            if hasattr(value, "is_floating_point") and value.is_floating_point() and value.dtype != model_dtype:
+                inputs[key] = value.to(dtype=model_dtype)
+    with torch.inference_mode():
+        logits = model(**inputs).logits
+    mask = inputs["attention_mask"] if "attention_mask" in inputs else None
+    segments = processor.extract_speaker_dict(logits, mask)[0]
+    return _rows_from_nemo_segments(segments)
 
 
 def _materialize_audio(source, workdir):
@@ -1230,7 +1346,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 13
+DIAG_PATCH_VERSION = 14
 IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
@@ -1238,17 +1354,18 @@ ROWS_CAP = 5000
 
 def _job_pyannote_mode():
     mode = (_diag_extra.get("job") or {}).get("pyannote_mode")
-    return mode if mode in ("raw", "programmed") else "programmed"
+    return mode if mode in ("raw", "programmed", "nemo") else "programmed"
 
 
 def _worker_identity(pyannote_mode="programmed"):
     """Identity of the image that is executing this job. Baked in at build time."""
-    mode = pyannote_mode if pyannote_mode in ("raw", "programmed") else "programmed"
+    mode = pyannote_mode if pyannote_mode in ("raw", "programmed", "nemo") else "programmed"
+    assignment = {"raw": "pyannote_raw", "nemo": "nemo_raw"}.get(mode, "three_pass_word")
     identity = {
         "image_tag": IMAGE_TAG or None,
         "base_commit": DIAG_BASE_COMMIT,
         "diag_patch": DIAG_PATCH_VERSION,
-        "assignment": "pyannote_raw" if mode == "raw" else "three_pass_word",
+        "assignment": assignment,
         "pyannote_mode": mode,
         "runpod_pod_id": os.environ.get("RUNPOD_POD_ID") or None,
         "runpod_endpoint_id": os.environ.get("RUNPOD_ENDPOINT_ID") or None,
@@ -1487,6 +1604,13 @@ def _diag_replacement(rescue, s0_labels, s1_labels):
         replaced = True
         code = "window_labels_from_embedding_clustering"
         reason = "The recount returned <2 speakers; S1 is built from embedding windows (_annotation_from_spans). Gaps between windows are not filled."
+    elif rescue == "nemo_raw":
+        replaced = False
+        code = "nemo_raw_segments"
+        reason = (
+            "Nemotron 3 Diarization offline segments, using the model's published defaults. "
+            "Pyannote was not called. Words take the span with the greatest overlap."
+        )
     else:
         replaced = None
         code = "unknown_rescue_value"
@@ -1557,7 +1681,7 @@ def _build_diarization_debug(rescue, speakers, segments, rows, job_id=None, dura
         "replacement": _diag_replacement(rescue, s0.get("labels"), len(speakers)),
         "warnings": _diag_warnings(rescue, speakers),
         "models": {
-            "diarization": DIARIZATION_MODEL,
+            "diarization": NEMO_DIARIZATION_MODEL if _job_pyannote_mode() == "nemo" else DIARIZATION_MODEL,
             "asr": WHISPER_MODEL,
             "device": DEVICE,
             "compute_type": COMPUTE_TYPE,
@@ -2223,7 +2347,7 @@ def handler(job):
     align_output = bool(job_input.get("align_output", True))
     diarization = bool(job_input.get("diarization", False))
     pyannote_mode = str(job_input.get("pyannote_mode") or "programmed").strip().lower()
-    if pyannote_mode not in ("raw", "programmed"):
+    if pyannote_mode not in ("raw", "programmed", "nemo"):
         pyannote_mode = "programmed"
     raw_controls = job_input.get("pyannote_raw") if pyannote_mode == "raw" else None
     if not isinstance(raw_controls, dict):
@@ -2270,21 +2394,41 @@ def handler(job):
             }
         if diarization and result["segments"]:
             t = time.time()
-            pipeline = _get_diarize_pipeline(hf_token)
-            annotation, rescue = _separate_speakers(
-                pipeline,
-                audio,
-                num_speakers=_optional_int(job_input, "num_speakers"),
-                min_speakers=_optional_int(job_input, "min_speakers"),
-                max_speakers=_optional_int(job_input, "max_speakers"),
-                mode=pyannote_mode,
-                raw_controls=raw_controls,
-            )
-            prepared = audio if pyannote_mode == "raw" else _prepare_diarization_audio(audio)
-            embedding_model = getattr(getattr(pipeline, "model", None), "_embedding", None)
-            result, diarization_rows = _assign_speakers(
-                result, annotation, prepared, embedding_model, mode=pyannote_mode
-            )
+            if pyannote_mode == "nemo":
+                _release_diarizer("pyannote")
+                _diag_runs.clear()
+                _diag_extra.clear()
+                _diag_note("job", pyannote_mode="nemo")
+                diarization_rows = _nemo_diarize(audio, hf_token)
+                labels = sorted({row["speaker"] for row in diarization_rows})
+                _diag_extra["s0"] = {
+                    "selected": "nemo",
+                    "labels": len(labels),
+                    "rows": diarization_rows,
+                }
+                _diag_note("word_voice", status="skipped", reason="nemo_raw", assignment="nemo_span")
+                _diag_note("within_split", status="skipped", reason="nemo_raw")
+                _diag_note("final", rescue="nemo_raw", final_labels=len(labels))
+                labeled = _label_words_by_pyannote_overlap(result["segments"], diarization_rows)
+                result["segments"] = _split_segments_by_speaker(labeled)
+                rescue = "nemo_raw"
+            else:
+                _release_diarizer("nemo")
+                pipeline = _get_diarize_pipeline(hf_token)
+                annotation, rescue = _separate_speakers(
+                    pipeline,
+                    audio,
+                    num_speakers=_optional_int(job_input, "num_speakers"),
+                    min_speakers=_optional_int(job_input, "min_speakers"),
+                    max_speakers=_optional_int(job_input, "max_speakers"),
+                    mode=pyannote_mode,
+                    raw_controls=raw_controls,
+                )
+                prepared = audio if pyannote_mode == "raw" else _prepare_diarization_audio(audio)
+                embedding_model = getattr(getattr(pipeline, "model", None), "_embedding", None)
+                result, diarization_rows = _assign_speakers(
+                    result, annotation, prepared, embedding_model, mode=pyannote_mode
+                )
             speakers = _collect_speakers(result.get("segments") or [], diarization_rows)
             diag_fields = _diag_output_fields(
                 rescue, speakers, result.get("segments") or [], diarization_rows, job.get("id"), duration_s

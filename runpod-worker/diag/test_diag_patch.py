@@ -49,7 +49,7 @@ for needle in ("_diag_record_s0(output, annotation)", "_diag_record_probe(", "_d
 WANTED_FUNCS = REQUIRED - {"_separate_speakers", "handler"} | {
     "_as_number", "_effective_settings", "_library_versions", "_capped_rows", "_worker_identity",
     "_job_pyannote_mode", "_bounded_number", "_bounded_count", "_parse_pyannote_raw",
-    "_public_raw_controls",
+    "_public_raw_controls", "_nemo_speaker_label", "_rows_from_nemo_segments",
 }
 body = []
 for node in TREE.body:
@@ -140,10 +140,27 @@ assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_bin
 assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
 assert debug["worker_code"]["assignment"] == "three_pass_word"
 assert debug["worker_code"]["pyannote_mode"] == "programmed"
-assert debug["worker_code"]["diag_patch"] >= 13
+assert debug["worker_code"]["diag_patch"] >= 14
 raw_identity = ns["_worker_identity"]("raw")
 assert raw_identity["assignment"] == "pyannote_raw" and raw_identity["pyannote_mode"] == "raw"
 assert "pyannote_raw" not in raw_identity
+nemo_identity = ns["_worker_identity"]("nemo")
+assert nemo_identity["assignment"] == "nemo_raw" and nemo_identity["pyannote_mode"] == "nemo"
+nemo_part = handler_src.split('if pyannote_mode == "nemo":', 1)[1].split("else:", 1)[0]
+assert "_nemo_diarize" in nemo_part
+assert "_prepare_diarization_audio" not in nemo_part
+assert "_configure_pipeline" not in nemo_part
+assert "_retie_words_three_passes" not in nemo_part
+assert "_split_within_speakers" not in nemo_part
+nemo_rows = ns["_rows_from_nemo_segments"]([
+    {"Speaker": 0, "Start": 0.0, "End": 1.25},
+    {"Speaker": 1, "Start": 1.25, "End": 1.25},
+    "2.0 3.5 speaker_2",
+])
+assert nemo_rows == [
+    {"start": 0.0, "end": 1.25, "speaker": "SPEAKER_00"},
+    {"start": 2.0, "end": 3.5, "speaker": "SPEAKER_02"},
+], nemo_rows
 raw_part = sep_src.split('if mode == "raw":', 1)[1].split('return annotation, "pyannote_raw"', 1)[0]
 assert "_apply_pyannote_raw" in raw_part
 assert "_prepare_diarization_audio" not in raw_part
@@ -181,6 +198,7 @@ for rescue, code, replaced in (
     ("num_speakers", "pipeline_recount_with_forced_speakers", True),
     ("windows", "window_labels_from_embedding_clustering", True),
     ("split_within", "within_speaker_embedding_split", True),
+    ("nemo_raw", "nemo_raw_segments", False),
 ):
     info = ns["_diag_replacement"](rescue, 1, 2)
     assert info["reason_code"] == code and info["replaced_pyannote_rows"] is replaced, info

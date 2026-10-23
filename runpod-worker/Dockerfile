@@ -40,9 +40,16 @@ RUN python -m pip install --upgrade "pip<25" setuptools wheel \
 
 COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install -r /tmp/requirements.txt \
+ && python -m pip install --no-deps whisperx==3.8.6 \
  && python - <<'PY'
 import importlib.metadata as md
-pins = {"torch": "2.8.0", "torchaudio": "2.8.0", "whisperx": "3.8.6", "pyannote.audio": "4.0.7"}
+pins = {
+    "torch": "2.8.0",
+    "torchaudio": "2.8.0",
+    "whisperx": "3.8.6",
+    "pyannote.audio": "4.0.7",
+    "transformers": "5.20.2",
+}
 for pkg, want in pins.items():
     got = md.version(pkg)
     assert got.split("+")[0] == want, f"{pkg} drifted: {got} != {want}"
@@ -55,7 +62,11 @@ import ctypes
 for lib in ("libcudnn.so.9", "libcudnn_cnn.so.9", "libcudnn_ops.so.9", "libcublas.so.12", "libcublasLt.so.12"):
     ctypes.CDLL(lib)
 import ctranslate2, torch, whisperx.asr, whisperx.alignment, whisperx.diarize  # noqa: F401
-print("LIBS_OK torch", torch.__version__, "cudnn", torch.backends.cudnn.version(), "ct2", ctranslate2.__version__)
+from transformers import AutoModelForAudioFrameClassification, AutoProcessor  # noqa: F401
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
+nemotron = [name for name in CONFIG_MAPPING_NAMES if "nemotron" in name and "diar" in name]
+assert nemotron, "transformers 5.20.2 has no Nemotron diarization config"
+print("LIBS_OK torch", torch.__version__, "cudnn", torch.backends.cudnn.version(), "ct2", ctranslate2.__version__, "nemotron", nemotron)
 PY
 
 COPY download_models.py /opt/worker/download_models.py
