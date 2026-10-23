@@ -511,6 +511,90 @@ def main():
     if len(set(blip_labels)) != 1 or blip_info.get("prints") != 1:
         failures.append(f"one odd word opened a speaker: {blip_labels} {blip_info}")
 
+    if module.DIAG_PATCH_VERSION < 9:
+        failures.append(f"three-pass word review is not in diag patch {module.DIAG_PATCH_VERSION}")
+
+    def alternating_case(second_vector):
+        class SplitEmbedding:
+            def __call__(self, tensor):
+                clips = tensor.arr[:, 0, :]
+                out = []
+                for clip in clips:
+                    if float(np.mean(np.abs(clip))) > 0.2:
+                        out.append([1.0, 0.0, 0.0])
+                    else:
+                        out.append(list(second_vector))
+                return np.asarray(out, dtype=np.float32)
+
+        spans = [
+            (0.20, 0.60), (0.70, 1.10), (1.20, 1.60),
+            (1.70, 2.10), (2.20, 2.60), (2.70, 3.10),
+        ]
+        audio = np.zeros(int(3.4 * SR), dtype=np.float32)
+        for index, (start, end) in enumerate(spans):
+            audio[int(start * SR):int(end * SR)] = 0.30 if index % 2 == 0 else 0.10
+        segments = [{"words": [word(start, end, "SPEAKER_00") for start, end in spans]}]
+        return SplitEmbedding(), audio, segments, spans
+
+    far_model, far_audio, far_segments, far_spans = alternating_case([0.0, 1.0, 0.0])
+    far_info = module._retie_words_by_voice(far_model, far_audio, far_segments)
+    far_labels = [item["speaker"] for item in far_segments[0]["words"]]
+    if (
+        far_labels != ["SPEAKER_00", "SPEAKER_01"] * 3
+        or far_info.get("review_passes") != 3
+        or far_info.get("review_unit") != "word"
+    ):
+        failures.append(f"interleaved different prints were mixed: {far_labels} {far_info}")
+    far_again = [{"words": [word(start, end, "SPEAKER_00") for start, end in far_spans]}]
+    module._retie_words_by_voice(far_model, far_audio, far_again)
+    if [item["speaker"] for item in far_again[0]["words"]] != far_labels:
+        failures.append("the stable shuffle changed labels for the same interleaved audio")
+
+    near_model, near_audio, near_segments, _near_spans = alternating_case([0.83, 0.55776, 0.0])
+    near_info = module._retie_words_by_voice(near_model, near_audio, near_segments)
+    near_labels = [item["speaker"] for item in near_segments[0]["words"]]
+    if near_info.get("status") != "ran" or near_labels != ["SPEAKER_00", "SPEAKER_01"] * 3:
+        failures.append(f"interleaved nearby prints were mixed: {near_labels} {near_info}")
+
+    same_alt_model, same_alt_audio, same_alt_segments, _same_spans = alternating_case([0.85, 0.526782, 0.0])
+    same_alt_info = module._retie_words_by_voice(same_alt_model, same_alt_audio, same_alt_segments)
+    same_alt_labels = {item["speaker"] for item in same_alt_segments[0]["words"]}
+    if same_alt_labels != {"SPEAKER_00"} or same_alt_info.get("prints") != 1:
+        failures.append(f"interleaved same-voice variation was split: {same_alt_labels} {same_alt_info}")
+
+    class LoudQuiet:
+        def __call__(self, tensor):
+            clips = tensor.arr[:, 0, :]
+            out = []
+            for clip in clips:
+                if float(np.mean(np.abs(clip))) > 0.2:
+                    out.append([1.0, 0.0, 0.0])
+                else:
+                    out.append([0.0, 1.0, 0.0])
+            return np.asarray(out, dtype=np.float32)
+
+    scattered_audio = np.zeros(int(5.5 * SR), dtype=np.float32)
+    loud_spans = [(0.20, 0.60), (0.70, 1.10), (1.20, 1.60)]
+    quiet_spans = [(3.00, 3.32), (3.40, 3.72), (4.50, 4.82), (4.90, 5.22)]
+    for start, end in loud_spans:
+        scattered_audio[int(start * SR):int(end * SR)] = 0.30
+    for start, end in quiet_spans:
+        scattered_audio[int(start * SR):int(end * SR)] = 0.10
+    scattered = [{"words": [word(start, end, "SPEAKER_00") for start, end in loud_spans + quiet_spans]}]
+    scattered_info = module._retie_words_by_voice(LoudQuiet(), scattered_audio, scattered)
+    scattered_loud = {item["speaker"] for item in scattered[0]["words"][:3]}
+    scattered_quiet = {item["speaker"] for item in scattered[0]["words"][3:]}
+    if (
+        scattered_info.get("status") != "ran"
+        or scattered_loud == scattered_quiet
+        or len(scattered_loud) != 1
+        or len(scattered_quiet) != 1
+    ):
+        failures.append(
+            f"a voice split by pauses was not kept: {scattered_info} "
+            f"loud={scattered_loud} quiet={scattered_quiet}"
+        )
+
     if failures:
         print("WITHIN_SPLIT_FAILED")
         for message in failures:
