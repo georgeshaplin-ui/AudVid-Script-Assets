@@ -140,7 +140,7 @@ assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_bin
 assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
 assert debug["worker_code"]["assignment"] == "three_pass_word"
 assert debug["worker_code"]["pyannote_mode"] == "programmed"
-assert debug["worker_code"]["diag_patch"] >= 15
+assert debug["worker_code"]["diag_patch"] >= 16
 raw_identity = ns["_worker_identity"]("raw")
 assert raw_identity["assignment"] == "pyannote_raw" and raw_identity["pyannote_mode"] == "raw"
 assert "pyannote_raw" not in raw_identity
@@ -197,6 +197,10 @@ assert "initial_prompt" not in transcribe_src
 assert 'task != "transcribe"' in transcribe_src
 assert 'detected != "ar"' in transcribe_src
 assert "_get_arabic_asr()" in transcribe_src
+prepare_src = ast.get_source_segment(TEXT, FUNCS["_prepare_arabic_dialect_input"])
+assert '"feature_size": 128' in prepare_src
+get_asr_src = ast.get_source_segment(TEXT, FUNCS["_get_arabic_asr"])
+assert get_asr_src.index("_prepare_arabic_dialect_input") < get_asr_src.index("whisperx.load_model")
 assert "ASR_MODEL.transcribe" in transcribe_src
 assert "_transcribe(" in handler_src
 assert handler_src.index("_release_arabic_asr()") < handler_src.index('if pyannote_mode == "nemo":')

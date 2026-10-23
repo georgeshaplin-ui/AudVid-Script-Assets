@@ -2,6 +2,7 @@ import base64
 import gc
 import hashlib
 import importlib.metadata
+import json
 import math
 import os
 import socket
@@ -146,12 +147,51 @@ def _release_arabic_asr():
         torch.cuda.empty_cache()
 
 
+def _prepare_arabic_dialect_input(model_dir):
+    """Tell the loader this model reads 128 mel bins, like large-v3.
+
+    The fine-tune ships without that file. The loader then builds an 80-bin
+    spectrogram, and the model rejects it.
+    """
+    path = os.path.join(model_dir, "preprocessor_config.json")
+    current = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                current = loaded
+        except (OSError, json.JSONDecodeError):
+            current = {}
+    if current.get("feature_size") == 128:
+        return
+    current.update(
+        {
+            "chunk_length": 30,
+            "feature_extractor_type": "WhisperFeatureExtractor",
+            "feature_size": 128,
+            "hop_length": 160,
+            "n_fft": 400,
+            "n_samples": 480000,
+            "nb_max_frames": 3000,
+            "padding_side": "right",
+            "padding_value": 0.0,
+            "processor_class": "WhisperProcessor",
+            "return_attention_mask": False,
+            "sampling_rate": 16000,
+        }
+    )
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(current, handle)
+
+
 def _get_arabic_asr():
     """Load the baked dialect model. It is not downloaded during the job."""
     global _arabic_asr
     if _arabic_asr is None:
         if not os.path.isfile(os.path.join(ARABIC_DIALECT_DIR, "model.bin")):
             raise RuntimeError(f"arabic dialect model is missing from the image: {ARABIC_DIALECT_DIR}")
+        _prepare_arabic_dialect_input(ARABIC_DIALECT_DIR)
         t0 = time.time()
         _arabic_asr = whisperx.load_model(
             ARABIC_DIALECT_DIR,
@@ -1414,7 +1454,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 15
+DIAG_PATCH_VERSION = 16
 IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
