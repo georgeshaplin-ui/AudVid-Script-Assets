@@ -49,6 +49,7 @@ pins = {
     "whisperx": "3.8.6",
     "pyannote.audio": "4.0.7",
     "transformers": "5.20.2",
+    "librosa": "0.11.0",
 }
 for pkg, want in pins.items():
     got = md.version(pkg)
@@ -61,7 +62,7 @@ RUN python - <<'PY'
 import ctypes
 for lib in ("libcudnn.so.9", "libcudnn_cnn.so.9", "libcudnn_ops.so.9", "libcublas.so.12", "libcublasLt.so.12"):
     ctypes.CDLL(lib)
-import ctranslate2, torch, whisperx.asr, whisperx.alignment, whisperx.diarize  # noqa: F401
+import ctranslate2, librosa, torch, whisperx.asr, whisperx.alignment, whisperx.diarize  # noqa: F401
 from transformers import AutoModelForAudioFrameClassification, AutoProcessor  # noqa: F401
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 nemotron = [name for name in CONFIG_MAPPING_NAMES if "nemotron" in name and "diar" in name]

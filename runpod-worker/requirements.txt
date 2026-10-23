@@ -10,4 +10,6 @@ omegaconf>=2.3.0
 torchcodec>=0.7.0,<0.8.0
 huggingface-hub>=1.31.0,<3.0.0
 transformers==5.20.2
+# 1.0.0 requires Python 3.12. The worker is Python 3.10, and 0.11.0 is the last release that imports there.
+librosa==0.11.0
 runpod==1.12.0
