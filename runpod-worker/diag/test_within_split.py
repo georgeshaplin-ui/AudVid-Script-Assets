@@ -515,8 +515,8 @@ def main():
     if blip_info.get("status") != "ran" or others != {"SPEAKER_00"} or blip_labels[3] in (None, "", "SPEAKER_00"):
         failures.append(f"a different word print was not its own speaker: {blip_labels} {blip_info}")
 
-    if module.DIAG_PATCH_VERSION < 10 or module._retie_words_by_voice.__doc__.find("clustering") < 0:
-        failures.append(f"voiceprint-only clustering is not in diag patch {module.DIAG_PATCH_VERSION}")
+    if module.DIAG_PATCH_VERSION < 11 or "reverse" not in (module._retie_words_by_voice.__doc__ or ""):
+        failures.append(f"three-pass word confirmation is not in diag patch {module.DIAG_PATCH_VERSION}")
 
     def alternating_case(second_vector):
         class SplitEmbedding:
@@ -545,8 +545,9 @@ def main():
     far_labels = [item["speaker"] for item in far_segments[0]["words"]]
     if (
         far_labels != ["SPEAKER_00", "SPEAKER_01"] * 3
-        or far_info.get("assignment") != "embedding_cluster"
-        or far_info.get("review_passes") != 1
+        or far_info.get("assignment") != "three_pass_word"
+        or far_info.get("review_passes") != 3
+        or far_info.get("review_orders") != ["forward", "reverse", "shuffle"]
         or far_info.get("review_unit") != "word"
     ):
         failures.append(f"interleaved different prints were mixed: {far_labels} {far_info}")

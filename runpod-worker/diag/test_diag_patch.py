@@ -136,7 +136,8 @@ assert debug["replacement"]["replaced_pyannote_rows"] is False
 assert debug["job_fingerprint_sha256_12"] == hashlib.sha256(b"job-1").hexdigest()[:12]
 assert debug["s1"]["word_binding"]["words_total"] == 3 and debug["s1"]["word_binding"]["tagged_final"] == 2
 assert debug["worker_code"]["base_commit"] and debug["worker_code"]["diag_patch"] >= 10
-assert debug["worker_code"]["assignment"] == "embedding_cluster"
+assert debug["worker_code"]["assignment"] == "three_pass_word"
+assert debug["worker_code"]["diag_patch"] >= 11
 json.dumps(ns["_clean"](fields))  # must serialise (NaN/inf/numpy handled by _clean)
 
 # rescue codes

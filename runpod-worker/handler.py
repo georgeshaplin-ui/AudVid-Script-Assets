@@ -56,13 +56,14 @@ DIAR_WITHIN_MIN_SPAN_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPAN_S", "
 # separate a real second voice.
 DIAR_WITHIN_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_WITHIN_MIN_SPEAKER_S", "1.0"))
 DIAR_WITHIN_MAX_CLUSTERS = int(os.environ.get("DIARIZATION_WITHIN_MAX_CLUSTERS", "4"))
-# Each measured word is embedded from its own audio, then every vector is
-# clustered once. Euclidean 0.75 on unit vectors is cosine similarity 0.72:
-# a shout or a pitch change stays one person, and a different voice does not.
-# A word with no vector stays unlabeled. Pause, neighbor, word count, and
-# walk order do not assign a speaker. The transcript text is not read.
+# Each measured word is confirmed from its own embedding three times:
+# forward in time, reverse, then a shuffle fixed by the word times.
+# Cosine above 0.72 is still that voice, including a shout or a pitch change.
+# A word at or below 0.72 does not inherit the sentence around it.
+# A word with no vector stays unlabeled. Pause, neighbor, and word count
+# do not assign a speaker. The transcript text is not read.
 DIAR_WORD_WINDOW_S = float(os.environ.get("DIARIZATION_WORD_WINDOW_S", "0.50"))
-DIAR_WORD_CLUSTER_DISTANCE = float(os.environ.get("DIARIZATION_WORD_CLUSTER_DISTANCE", "0.75"))
+DIAR_WORD_JOIN = float(os.environ.get("DIARIZATION_WORD_JOIN", "0.72"))
 DIAR_WINDOW_S = float(os.environ.get("DIARIZATION_WINDOW_S", "1.25"))
 DIAR_MAX_WINDOWS = int(os.environ.get("DIARIZATION_MAX_WINDOWS", "160"))
 DIAR_MIN_SPEAKER_S = float(os.environ.get("DIARIZATION_MIN_SPEAKER_S", "0.8"))
@@ -1031,7 +1032,7 @@ def _rows_from_annotation(annotation):
 # transcription result or any algorithm constant. Every entry point swallows its own errors,
 # so a diagnostics bug can never fail or change a transcription.
 # ---------------------------------------------------------------------------------------
-DIAG_PATCH_VERSION = 10
+DIAG_PATCH_VERSION = 11
 IMAGE_TAG = os.environ.get("AUDVID_IMAGE_TAG", "").strip()
 DIAG_BASE_COMMIT = "c99803c"
 ROWS_CAP = 5000
@@ -1043,7 +1044,7 @@ def _worker_identity():
         "image_tag": IMAGE_TAG or None,
         "base_commit": DIAG_BASE_COMMIT,
         "diag_patch": DIAG_PATCH_VERSION,
-        "assignment": "embedding_cluster",
+        "assignment": "three_pass_word",
         "runpod_pod_id": os.environ.get("RUNPOD_POD_ID") or None,
         "runpod_endpoint_id": os.environ.get("RUNPOD_ENDPOINT_ID") or None,
         "runpod_dc_id": os.environ.get("RUNPOD_DC_ID") or None,
@@ -1718,12 +1719,142 @@ def _word_print_records(words, reliable, matrix, centers, names):
     return records, centers_out
 
 
-def _retie_words_by_voice(embedding_model, audio, segments):
-    """Label every measured word by one clustering of its own embedding.
+def _mean_print(rows):
+    center = np.mean(np.vstack(rows), axis=0)
+    return center / max(float(np.linalg.norm(center)), 1e-8)
 
-    The previous label is not evidence. A word too short or too quiet to embed
-    stays unlabeled. A pause, a neighbor, a word count, or the visit order
-    does not assign a speaker.
+
+def _confirm_words_in_order(order, matrix, join_cosine):
+    """Assign each word from its own vector. The center already opened stays put
+    until this word itself clears the join gate. Nothing here reads time gaps.
+    """
+    groups = []
+    assigned = {}
+    for index in order:
+        vector = np.asarray(matrix[index], dtype=np.float64)
+        host = None
+        if groups:
+            scores = [float(np.dot(vector, _mean_print(group))) for group in groups]
+            best = int(np.argmax(scores))
+            if scores[best] > join_cosine:
+                host = best
+        if host is None:
+            groups.append([vector])
+            host = len(groups) - 1
+        else:
+            groups[host].append(vector)
+        assigned[int(index)] = host
+    centers = [_mean_print(group) for group in groups]
+    return centers, assigned
+
+
+def _word_review_orders(words, reliable):
+    """Time order, reverse order, and a shuffle fixed by the word times.
+
+    The shuffle is not drawn again on the next request. The same file keeps
+    the same third pass, so a speaker label does not flicker between runs.
+    """
+    forward = sorted(
+        range(len(reliable)),
+        key=lambda index: (
+            float(words[reliable[index]]["start"]),
+            float(_word_duration(words[reliable[index]])[1]),
+            index,
+        ),
+    )
+    reverse = list(reversed(forward))
+    seed = 0
+    for index in forward:
+        start, _end, duration = _word_duration(words[reliable[index]])
+        seed = (
+            seed * 1000003
+            + int(round(start * 1000.0))
+            + int(round(duration * 1000.0))
+            + 1
+        ) % (2 ** 32)
+    permutation = np.random.RandomState(seed).permutation(len(forward))
+    shuffled = [forward[int(position)] for position in permutation]
+    return (("forward", forward), ("reverse", reverse), ("shuffle", shuffled))
+
+
+def _consensus_print_centers(pass_centers, match_cosine):
+    """Keep a print when a matching center was opened in at least two passes."""
+    items = []
+    for pass_index, centers in enumerate(pass_centers):
+        for center in centers:
+            items.append((int(pass_index), np.asarray(center, dtype=np.float64)))
+    used = [False] * len(items)
+    kept = []
+    for index, (_pass_index, center) in enumerate(items):
+        if used[index]:
+            continue
+        members = [(items[index][0], center)]
+        used[index] = True
+        for other_index in range(index + 1, len(items)):
+            if used[other_index]:
+                continue
+            other_pass, other = items[other_index]
+            if float(np.dot(center, other)) <= match_cosine:
+                continue
+            members.append((other_pass, other))
+            used[other_index] = True
+        passes = {item_pass for item_pass, _item_center in members}
+        if len(passes) < 2:
+            continue
+        kept.append(_mean_print([item_center for _item_pass, item_center in members]))
+    return kept
+
+
+def _review_each_word(matrix, words, reliable):
+    """Three word orders. A word keeps the print that two passes agree on."""
+    passes = []
+    for _name, order in _word_review_orders(words, reliable):
+        centers, assigned = _confirm_words_in_order(order, matrix, DIAR_WORD_JOIN)
+        if centers:
+            passes.append((centers, assigned))
+    if not passes:
+        return None, None
+    centers = _consensus_print_centers([item[0] for item in passes], DIAR_WORD_JOIN)
+    if not centers:
+        centers = [np.asarray(center, dtype=np.float64).copy() for center in passes[0][0]]
+    choice = []
+    extra = []
+    for index in range(matrix.shape[0]):
+        votes = {}
+        for pass_centers, assigned in passes:
+            chosen = assigned.get(index)
+            if chosen is None or chosen >= len(pass_centers):
+                continue
+            scores = [float(np.dot(pass_centers[chosen], center)) for center in centers]
+            mapped = int(np.argmax(scores))
+            if scores[mapped] <= DIAR_WORD_JOIN:
+                continue
+            votes[mapped] = votes.get(mapped, 0) + 1
+        if votes:
+            winner = max(votes, key=lambda item: (votes[item], -item))
+            if votes[winner] >= 2:
+                choice.append(winner)
+                continue
+        scores = [float(np.dot(matrix[index], center)) for center in centers]
+        best = int(np.argmax(scores))
+        if scores[best] > DIAR_WORD_JOIN:
+            choice.append(best)
+            continue
+        choice.append(len(centers) + len(extra))
+        extra.append(np.asarray(matrix[index], dtype=np.float64).copy())
+    if extra:
+        centers.extend(extra)
+    return centers, choice
+
+
+def _retie_words_by_voice(embedding_model, audio, segments):
+    """Confirm every measured word three times from its own embedding.
+
+    The passes visit the words forward, in reverse, and in a fixed shuffle.
+    Two passes must agree. A word that does not match an agreed print stays
+    its own voice. The previous label is not evidence. A word too short or
+    too quiet to embed stays unlabeled. A pause or a neighbor does not assign
+    a speaker, and words in one sentence are not assumed to be one print.
     """
     if embedding_model is None or audio is None or len(audio) == 0:
         return {"status": "skipped", "reason": "no_embedding_model"}
@@ -1762,21 +1893,15 @@ def _retie_words_by_voice(embedding_model, audio, segments):
         return {"status": "skipped", "reason": "too_few_words", "words": len(reliable)}
     original = [str(words[index].get("speaker") or "") for index in reliable]
     matrix = _normalize_rows(embedded)
-    labels, similarity = _cluster_embeddings(
-        matrix,
-        DIAR_WORD_CLUSTER_DISTANCE,
-        min_clusters=1,
-        max_clusters=min(DIAR_MAX_AUTO_SPEAKERS, int(matrix.shape[0])),
-    )
-    choice = [int(value) for value in labels]
-    centers = []
-    for print_index in range(max(choice) + 1 if choice else 0):
-        block = matrix[np.asarray(choice) == print_index]
-        if len(block) == 0:
-            centers.append(np.zeros(matrix.shape[1], dtype=np.float64))
-            continue
-        center = block.mean(axis=0)
-        centers.append(center / max(float(np.linalg.norm(center)), 1e-8))
+    centers, choice = _review_each_word(matrix, words, reliable)
+    if not centers:
+        return {"status": "skipped", "reason": "no_print", "words": len(reliable)}
+    similarity = 1.0
+    if len(centers) >= 2:
+        bank = np.vstack(centers)
+        scores = bank @ bank.T
+        np.fill_diagonal(scores, 2.0)
+        similarity = float(np.min(scores))
     first_at = []
     for print_index in range(len(centers)):
         times = [
@@ -1800,19 +1925,19 @@ def _retie_words_by_voice(embedding_model, audio, segments):
         if str(words[reliable[index]].get("speaker") or "") != name
     )
     word_prints, print_centers = _word_print_records(words, reliable, matrix, centers, names)
-    same_voice = 1.0 - (DIAR_WORD_CLUSTER_DISTANCE ** 2) / 2.0
     return {
         "status": "ran",
         "words": len(reliable),
         "splits": int(max(0, len(final_names) - len({name for name in original if name}))),
         "moved": int(moved),
         "prints": len(final_names),
-        "match_min_cosine": round(same_voice, 4),
-        "new_speaker_max_cosine": round(same_voice, 4),
+        "match_min_cosine": DIAR_WORD_JOIN,
+        "new_speaker_max_cosine": DIAR_WORD_JOIN,
         "centroid_cosine": round(float(similarity), 4),
-        "review_passes": 1,
+        "review_passes": 3,
+        "review_orders": ["forward", "reverse", "shuffle"],
         "review_unit": "word",
-        "assignment": "embedding_cluster",
+        "assignment": "three_pass_word",
         "embedding_dim": int(matrix.shape[1]),
         "word_prints": word_prints,
         "print_centers": print_centers,
